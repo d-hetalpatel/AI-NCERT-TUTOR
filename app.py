@@ -10,7 +10,7 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 import io
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -24,10 +24,13 @@ EXTRACT_DIR = "ncert"
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 GEN_MODEL_NAME = "google/flan-t5-small"
-TOP_K = 4
+
+RETRIEVE_K = 20        # broad candidate pool fetched from FAISS
+RERANK_TOP_K = 6       # top chunks after cross-encoder reranking passed to generator
 BATCH_SIZE = 64
-OCR_DPI = 200  # higher = better quality but slower
+OCR_DPI = 200
 
 # ==========================================================
 # PAGE CONFIG
@@ -134,7 +137,6 @@ def extract_text_from_pdf(pdf_path):
     """Try direct text extraction first, fall back to OCR if needed."""
     text = ""
 
-    # Attempt 1: direct text layer via PyMuPDF
     try:
         doc = fitz.open(pdf_path)
         for page in doc:
@@ -148,7 +150,7 @@ def extract_text_from_pdf(pdf_path):
     if len(text.strip()) > 100:
         return text
 
-    # Attempt 2: OCR via pytesseract
+    # Fallback: OCR via pytesseract
     text = ""
     try:
         doc = fitz.open(pdf_path)
@@ -228,7 +230,7 @@ if len(all_chunks) == 0:
 st.success(f"✅ Created {len(all_chunks)} text chunks")
 
 # ==========================================================
-# BUILD VECTOR INDEX
+# BUILD VECTOR INDEX  (cosine similarity via IndexFlatIP + L2 normalisation)
 # ==========================================================
 @st.cache_resource(show_spinner=False)
 def build_index(chunks, model_name):
@@ -250,16 +252,31 @@ def build_index(chunks, model_name):
 
     progress.empty()
     embeddings = np.vstack(all_embeddings).astype("float32")
+
+    # L2-normalise → inner product == cosine similarity
+    faiss.normalize_L2(embeddings)
+
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
+    index = faiss.IndexFlatIP(dim)   # Inner Product (cosine after normalisation)
     index.add(embeddings)
 
     return embed_model, index, chunks
 
 
-st.info("⚙️ Building vector index...")
-embed_model, index, metadata = build_index(all_chunks, EMBED_MODEL_NAME)
+st.info("⚙️ Building vector index (cosine similarity)...")
+embed_model, faiss_index, metadata = build_index(all_chunks, EMBED_MODEL_NAME)
 st.success("✅ Vector index ready")
+
+# ==========================================================
+# LOAD CROSS-ENCODER RERANKER
+# ==========================================================
+@st.cache_resource
+def load_reranker(model_name):
+    return CrossEncoder(model_name, max_length=512)
+
+
+reranker = load_reranker(RERANK_MODEL_NAME)
+st.success("✅ Cross-encoder reranker loaded")
 
 # ==========================================================
 # LOAD GENERATION MODEL
@@ -276,12 +293,29 @@ tokenizer, gen_model = load_generator(GEN_MODEL_NAME)
 st.success("✅ Generation model loaded")
 
 # ==========================================================
-# RETRIEVAL
+# RETRIEVAL  →  RERANKING  →  TOP-K SELECTION
 # ==========================================================
-def retrieve(query, top_k=TOP_K):
-    q_emb = embed_model.encode([query]).astype("float32")
-    D, I = index.search(q_emb, top_k)
-    return [metadata[i] for i in I[0]]
+def retrieve_and_rerank(query):
+    # Step 1: embed query (normalise for cosine similarity)
+    q_emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
+    faiss.normalize_L2(q_emb)
+
+    # Step 2: fetch broad candidate pool from FAISS
+    _, I = faiss_index.search(q_emb, RETRIEVE_K)
+    candidates = [metadata[i] for i in I[0] if i < len(metadata)]
+
+    if not candidates:
+        return []
+
+    # Step 3: cross-encoder reranking — score every (query, chunk) pair
+    pairs = [[query, c["text"]] for c in candidates]
+    scores = reranker.predict(pairs)                 # shape: (RETRIEVE_K,)
+
+    # Step 4: sort by reranker score descending, keep top RERANK_TOP_K
+    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+    top_chunks = [chunk for _, chunk in ranked[:RERANK_TOP_K]]
+
+    return top_chunks
 
 # ==========================================================
 # PROMPT BUILDER
@@ -301,7 +335,7 @@ def build_prompt(context_chunks, question):
 # GENERATION
 # ==========================================================
 def generate_answer(query):
-    retrieved = retrieve(query)
+    retrieved = retrieve_and_rerank(query)
     if not retrieved:
         return "No relevant information found.", []
 
@@ -318,16 +352,25 @@ def generate_answer(query):
 # USER INTERFACE
 # ==========================================================
 st.markdown("---")
+
+with st.sidebar:
+    st.header("⚙️ Retrieval Settings")
+    st.metric("Candidate pool (FAISS)", RETRIEVE_K)
+    st.metric("After reranking (cross-encoder)", RERANK_TOP_K)
+    st.caption(f"Embed model: `{EMBED_MODEL_NAME}`")
+    st.caption(f"Reranker: `{RERANK_MODEL_NAME}`")
+    st.caption(f"Generator: `{GEN_MODEL_NAME}`")
+
 query = st.text_input("💬 Ask your question from NCERT:", placeholder="e.g. What is photosynthesis?")
 
 if query:
-    with st.spinner("Generating answer..."):
+    with st.spinner("Retrieving, reranking and generating answer..."):
         answer, retrieved_chunks = generate_answer(query)
 
     st.markdown("## 📖 Answer")
     st.write(answer)
 
-    st.markdown("## 📚 Top Retrieved Chunks Used to Generate the Answer")
+    st.markdown(f"## 📚 Top {RERANK_TOP_K} Reranked Chunks Used to Generate the Answer")
     for i, chunk in enumerate(retrieved_chunks):
         with st.expander(f"Chunk {i + 1} — {chunk['doc_id']}"):
             st.write(chunk["text"])
