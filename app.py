@@ -49,7 +49,7 @@ def download_and_extract(file_id):
                     quiet=False,
                     fuzzy=True
                 )
-                success = os.path.exists(ZIP_PATH) and os.path.getsize(ZIP_PATH) > 1000
+                success = os.path.exists(ZIP_PATH) and os.path.getsize(ZIP_PATH) > 10000
             except Exception as e:
                 st.warning(f"Primary download failed: {e}. Trying fallback...")
 
@@ -81,11 +81,12 @@ def download_and_extract(file_id):
                             if chunk:
                                 f.write(chunk)
 
-                    if os.path.getsize(ZIP_PATH) < 1000:
+                    if not os.path.exists(ZIP_PATH) or os.path.getsize(ZIP_PATH) < 10000:
                         raise ValueError("Downloaded file too small — likely an HTML error page.")
 
                     st.success("Downloaded via fallback method.")
                     success = True
+
                 except Exception as e2:
                     st.error(
                         f"Both download methods failed.\n\nError: {e2}\n\n"
@@ -95,19 +96,42 @@ def download_and_extract(file_id):
                     )
                     st.stop()
 
+    # Validate it's actually a zip before extracting
+    if not zipfile.is_zipfile(ZIP_PATH):
+        os.remove(ZIP_PATH)
+        st.error(
+            "The downloaded file is not a valid ZIP. "
+            "Google likely blocked the download and returned an HTML page. "
+            "Please manually download the file from Google Drive and place it "
+            f"as `{ZIP_PATH}` next to app.py, then rerun."
+        )
+        st.stop()
+
     if not os.path.exists(EXTRACT_DIR):
         with st.spinner("Extracting ZIP..."):
-            try:
-                with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
-                    zip_ref.extractall(EXTRACT_DIR)
-            except zipfile.BadZipFile:
-                os.remove(ZIP_PATH)
-                st.error(
-                    "The downloaded file is not a valid ZIP. "
-                    "This usually means Google blocked the download. "
-                    "Please manually download and place it as `ncert.zip` next to app.py."
-                )
-                st.stop()
+            with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
+                zip_ref.extractall(EXTRACT_DIR)
+
+    # Debug: show what was extracted
+    all_extracted = []
+    for root, dirs, files in os.walk(EXTRACT_DIR):
+        for f in files:
+            all_extracted.append(os.path.join(root, f))
+
+    st.info(f"📂 Total files extracted: {len(all_extracted)}")
+
+    pdf_files = [f for f in all_extracted if f.lower().endswith(".pdf")]
+    st.info(f"📄 PDF files found: {len(pdf_files)}")
+
+    if pdf_files:
+        st.success("Sample PDFs found:\n" + "\n".join(pdf_files[:5]))
+    else:
+        st.warning(
+            "No PDF files found after extraction. "
+            "Showing full extracted file tree for debugging:"
+        )
+        tree_preview = "\n".join(all_extracted[:50])
+        st.code(tree_preview)
 
     return EXTRACT_DIR
 
@@ -115,7 +139,7 @@ def download_and_extract(file_id):
 data_path = download_and_extract(FILE_ID)
 
 # ==========================================================
-# LOAD DOCUMENTS
+# LOAD DOCUMENTS  
 # ==========================================================
 @st.cache_resource
 def load_documents(folder):
@@ -138,13 +162,23 @@ def load_documents(folder):
                             "doc_id": file,
                             "text": text
                         })
-                except Exception:
+                except Exception as e:
+                    st.warning(f"Could not read {file}: {e}")
                     continue
 
     return docs
 
 
 documents = load_documents(data_path)
+
+if len(documents) == 0:
+    st.error(
+        "No PDF files were loaded. This means the ZIP extracted successfully "
+        "but either contains no PDFs, or they are in an unexpected folder structure. "
+        "Check the file tree shown above to understand the ZIP contents."
+    )
+    st.stop()
+
 st.success(f"✅ Loaded {len(documents)} PDF files")
 
 # ==========================================================
@@ -158,7 +192,6 @@ def split_documents(docs, chunk_size, overlap):
     )
 
     chunks = []
-
     for doc in docs:
         pieces = splitter.split_text(doc["text"])
         for i, piece in enumerate(pieces):
@@ -172,6 +205,11 @@ def split_documents(docs, chunk_size, overlap):
 
 
 all_chunks = split_documents(documents, CHUNK_SIZE, CHUNK_OVERLAP)
+
+if len(all_chunks) == 0:
+    st.error("No text chunks were created. The PDFs may be scanned images with no extractable text.")
+    st.stop()
+
 st.success(f"✅ Created {len(all_chunks)} text chunks")
 
 # ==========================================================
@@ -194,7 +232,10 @@ def build_index(chunks, model_name):
             show_progress_bar=False
         )
         all_embeddings.append(emb)
-        progress.progress(min((i + BATCH_SIZE) / total, 1.0), text=f"Embedding chunks... {min(i + BATCH_SIZE, total)}/{total}")
+        progress.progress(
+            min((i + BATCH_SIZE) / total, 1.0),
+            text=f"Embedding chunks... {min(i + BATCH_SIZE, total)}/{total}"
+        )
 
     progress.empty()
 
