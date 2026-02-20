@@ -4,6 +4,7 @@ import zipfile
 import numpy as np
 import faiss
 import torch
+import requests
 import gdown
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -13,25 +14,14 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 # ==========================================================
 # CONFIG
 # ==========================================================
-#FILE_ID = "1toFD-1u6BSpdDU-cop12nne2ysPgPHM0"
-#ZIP_PATH = "ncert.zip"
-#EXTRACT_DIR = "ncert_extracted"
-
-# ==========================================================
-# CONFIG
-# ==========================================================
-#FILE_ID = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
-#ZIP_PATH = "ncert_data.zip"
-#EXTRACT_DIR = "ncert_data"
-
 FILE_ID = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
-ZIP_PATH = f"ncert.zip"
-EXTRACT_DIR = f"ncert"
+ZIP_PATH = "ncert.zip"
+EXTRACT_DIR = "ncert"
 
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-small"  # Cloud safe
+GEN_MODEL_NAME = "google/flan-t5-small"
 TOP_K = 4
 BATCH_SIZE = 64
 
@@ -49,15 +39,75 @@ st.caption("Ask questions from NCERT textbooks using Retrieval-Augmented Generat
 def download_and_extract(file_id):
     if not os.path.exists(ZIP_PATH):
         with st.spinner("Downloading NCERT dataset..."):
-            gdown.download(
-                f"https://drive.google.com/uc?id={file_id}",
-                ZIP_PATH,
-                quiet=False
-            )
+            success = False
+
+            # Method 1: gdown with fuzzy=True
+            try:
+                gdown.download(
+                    id=file_id,
+                    output=ZIP_PATH,
+                    quiet=False,
+                    fuzzy=True
+                )
+                success = os.path.exists(ZIP_PATH) and os.path.getsize(ZIP_PATH) > 1000
+            except Exception as e:
+                st.warning(f"Primary download failed: {e}. Trying fallback...")
+
+            # Method 2: requests session with confirm token
+            if not success:
+                try:
+                    session = requests.Session()
+                    URL = "https://drive.google.com/uc?export=download"
+
+                    response = session.get(URL, params={"id": file_id}, stream=True)
+
+                    token = next(
+                        (v for k, v in response.cookies.items() if k.startswith("download_warning")),
+                        None
+                    )
+
+                    if token:
+                        response = session.get(
+                            URL, params={"id": file_id, "confirm": token}, stream=True
+                        )
+                    else:
+                        response = session.get(
+                            f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t",
+                            stream=True
+                        )
+
+                    with open(ZIP_PATH, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=32768):
+                            if chunk:
+                                f.write(chunk)
+
+                    if os.path.getsize(ZIP_PATH) < 1000:
+                        raise ValueError("Downloaded file too small — likely an HTML error page.")
+
+                    st.success("Downloaded via fallback method.")
+                    success = True
+                except Exception as e2:
+                    st.error(
+                        f"Both download methods failed.\n\nError: {e2}\n\n"
+                        f"**Manual fix:** Download the file from "
+                        f"https://drive.google.com/file/d/{file_id}/view "
+                        f"and place it as `{ZIP_PATH}` next to app.py, then rerun."
+                    )
+                    st.stop()
 
     if not os.path.exists(EXTRACT_DIR):
-        with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
-            zip_ref.extractall(EXTRACT_DIR)
+        with st.spinner("Extracting ZIP..."):
+            try:
+                with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
+                    zip_ref.extractall(EXTRACT_DIR)
+            except zipfile.BadZipFile:
+                os.remove(ZIP_PATH)
+                st.error(
+                    "The downloaded file is not a valid ZIP. "
+                    "This usually means Google blocked the download. "
+                    "Please manually download and place it as `ncert.zip` next to app.py."
+                )
+                st.stop()
 
     return EXTRACT_DIR
 
@@ -88,14 +138,14 @@ def load_documents(folder):
                             "doc_id": file,
                             "text": text
                         })
-                except:
+                except Exception:
                     continue
 
     return docs
 
 
 documents = load_documents(data_path)
-st.success(f"Loaded {len(documents)} PDF files")
+st.success(f"✅ Loaded {len(documents)} PDF files")
 
 # ==========================================================
 # CHUNKING
@@ -111,42 +161,40 @@ def split_documents(docs, chunk_size, overlap):
 
     for doc in docs:
         pieces = splitter.split_text(doc["text"])
-        for i, chunk in enumerate(pieces):
+        for i, piece in enumerate(pieces):
             chunks.append({
                 "doc_id": doc["doc_id"],
                 "chunk_id": f"{doc['doc_id']}_chunk_{i}",
-                "text": chunk
+                "text": piece
             })
 
     return chunks
 
 
 all_chunks = split_documents(documents, CHUNK_SIZE, CHUNK_OVERLAP)
-st.success(f"Created {len(all_chunks)} text chunks")
+st.success(f"✅ Created {len(all_chunks)} text chunks")
 
 # ==========================================================
 # BUILD VECTOR INDEX (BATCHED)
 # ==========================================================
 @st.cache_resource(show_spinner=False)
 def build_index(chunks, model_name):
-
     embed_model = SentenceTransformer(model_name)
     texts = [c["text"] for c in chunks]
 
     all_embeddings = []
     total = len(texts)
-
-    progress = st.progress(0)
+    progress = st.progress(0, text="Building vector index...")
 
     for i in range(0, total, BATCH_SIZE):
-        batch = texts[i:i+BATCH_SIZE]
+        batch = texts[i:i + BATCH_SIZE]
         emb = embed_model.encode(
             batch,
             convert_to_numpy=True,
             show_progress_bar=False
         )
         all_embeddings.append(emb)
-        progress.progress(min((i + BATCH_SIZE) / total, 1.0))
+        progress.progress(min((i + BATCH_SIZE) / total, 1.0), text=f"Embedding chunks... {min(i + BATCH_SIZE, total)}/{total}")
 
     progress.empty()
 
@@ -159,9 +207,9 @@ def build_index(chunks, model_name):
     return embed_model, index, chunks
 
 
-st.info("Building vector index (first run may take a few minutes)...")
+st.info("⚙️ Building vector index (first run may take a few minutes)...")
 embed_model, index, metadata = build_index(all_chunks, EMBED_MODEL_NAME)
-st.success("Vector index ready")
+st.success("✅ Vector index ready")
 
 # ==========================================================
 # LOAD GENERATION MODEL
@@ -174,7 +222,8 @@ def load_generator(model_name):
     return tokenizer, model
 
 
-tokenizer, model = load_generator(GEN_MODEL_NAME)
+tokenizer, gen_model = load_generator(GEN_MODEL_NAME)
+st.success("✅ Generation model loaded")
 
 # ==========================================================
 # RETRIEVAL
@@ -188,28 +237,20 @@ def retrieve(query, top_k=TOP_K):
 # PROMPT BUILDER
 # ==========================================================
 def build_prompt(context_chunks, question):
-
     context = "\n\n".join([c["text"] for c in context_chunks])
-
-    return f"""
-You are an AI tutor specializing in NCERT textbooks.
-Answer ONLY using the provided context.
-Be clear and concise.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
+    return (
+        f"You are an AI tutor specializing in NCERT textbooks.\n"
+        f"Answer ONLY using the provided context.\n"
+        f"Be clear and concise.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question:\n{question}\n\n"
+        f"Answer:"
+    )
 
 # ==========================================================
 # GENERATION
 # ==========================================================
 def generate_answer(query):
-
     retrieved = retrieve(query)
 
     if not retrieved:
@@ -225,31 +266,44 @@ def generate_answer(query):
     )
 
     with torch.no_grad():
-        outputs = model.generate(
+        outputs = gen_model.generate(
             **inputs,
-            max_length=256
+            max_new_tokens=256
         )
 
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
     return answer.strip(), retrieved
 
 # ==========================================================
 # USER INTERFACE
 # ==========================================================
-query = st.text_input("Ask your question from NCERT:")
+st.markdown("---")
+query = st.text_input("💬 Ask your question from NCERT:", placeholder="e.g. What is photosynthesis?")
 
 if query:
     with st.spinner("Generating answer..."):
         answer, retrieved_chunks = generate_answer(query)
 
-    # Answer
     st.markdown("## 📖 Answer")
     st.write(answer)
 
-    # Retrieved Context Section
-    st.markdown("## 📚 Top K Retrieved Chunks Used to Generate the Answer")
-
+    st.markdown("## 📚 Top Retrieved Chunks Used to Generate the Answer")
     for i, chunk in enumerate(retrieved_chunks):
-        with st.expander(f"Chunk {i+1} — {chunk['doc_id']}"):
+        with st.expander(f"Chunk {i + 1} — {chunk['doc_id']}"):
             st.write(chunk["text"])
+```
+
+---
+
+**requirements.txt** — replace yours with this:
+```
+streamlit
+pypdf
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+torch
+transformers
+gdown
+requests
+numpy
