@@ -6,7 +6,10 @@ import faiss
 import torch
 import requests
 import gdown
-from pypdf import PdfReader
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+import io
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -24,6 +27,7 @@ EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 GEN_MODEL_NAME = "google/flan-t5-small"
 TOP_K = 4
 BATCH_SIZE = 64
+OCR_DPI = 200  # higher = better quality but slower
 
 # ==========================================================
 # PAGE CONFIG
@@ -44,13 +48,12 @@ def extract_all_zips(folder):
             for file in files:
                 if file.lower().endswith(".zip"):
                     zip_path = os.path.join(root, file)
-                    # Extract into a subfolder named after the zip (without extension)
                     extract_to = os.path.join(root, os.path.splitext(file)[0])
                     if not os.path.exists(extract_to):
                         try:
                             with zipfile.ZipFile(zip_path, "r") as zf:
                                 zf.extractall(extract_to)
-                            found_new = True  # keep looping in case of deeper nesting
+                            found_new = True
                         except Exception as e:
                             st.warning(f"Could not extract {file}: {e}")
 
@@ -63,19 +66,12 @@ def download_and_extract(file_id):
         with st.spinner("Downloading NCERT dataset..."):
             success = False
 
-            # Method 1: gdown with fuzzy=True
             try:
-                gdown.download(
-                    id=file_id,
-                    output=ZIP_PATH,
-                    quiet=False,
-                    fuzzy=True
-                )
+                gdown.download(id=file_id, output=ZIP_PATH, quiet=False, fuzzy=True)
                 success = os.path.exists(ZIP_PATH) and os.path.getsize(ZIP_PATH) > 10000
             except Exception as e:
                 st.warning(f"Primary download failed: {e}. Trying fallback...")
 
-            # Method 2: requests session with confirm token
             if not success:
                 try:
                     session = requests.Session()
@@ -86,11 +82,8 @@ def download_and_extract(file_id):
                         (v for k, v in response.cookies.items() if k.startswith("download_warning")),
                         None
                     )
-
                     if token:
-                        response = session.get(
-                            URL, params={"id": file_id, "confirm": token}, stream=True
-                        )
+                        response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True)
                     else:
                         response = session.get(
                             f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t",
@@ -103,107 +96,117 @@ def download_and_extract(file_id):
                                 f.write(chunk)
 
                     if not os.path.exists(ZIP_PATH) or os.path.getsize(ZIP_PATH) < 10000:
-                        raise ValueError("Downloaded file too small — likely an HTML error page.")
-
-                    st.success("Downloaded via fallback method.")
+                        raise ValueError("Downloaded file too small.")
 
                 except Exception as e2:
-                    st.error(
-                        f"Both download methods failed.\n\nError: {e2}\n\n"
-                        f"**Manual fix:** Download the file from "
-                        f"https://drive.google.com/file/d/{file_id}/view "
-                        f"and place it as `{ZIP_PATH}` next to app.py, then rerun."
-                    )
+                    st.error(f"Both download methods failed.\n\nError: {e2}")
                     st.stop()
 
-    # Validate ZIP
     if not zipfile.is_zipfile(ZIP_PATH):
         os.remove(ZIP_PATH)
-        st.error(
-            "The downloaded file is not a valid ZIP. "
-            "Google likely blocked the download. "
-            "Please manually download and place it as `ncert.zip` next to app.py."
-        )
+        st.error("Downloaded file is not a valid ZIP. Please download manually and place as `ncert.zip`.")
         st.stop()
 
-    # Extract outer ZIP
     if not os.path.exists(EXTRACT_DIR):
         with st.spinner("Extracting outer ZIP..."):
             with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
                 zip_ref.extractall(EXTRACT_DIR)
 
-    # Recursively extract all inner ZIPs (subject ZIPs containing the actual PDFs)
     with st.spinner("Extracting inner subject ZIPs..."):
         extract_all_zips(EXTRACT_DIR)
 
-    # Count PDFs after full extraction
-    all_files = []
+    pdf_files = []
     for root, _, files in os.walk(EXTRACT_DIR):
         for f in files:
-            all_files.append(os.path.join(root, f))
+            if f.lower().endswith(".pdf"):
+                pdf_files.append(os.path.join(root, f))
 
-    pdf_files = [f for f in all_files if f.lower().endswith(".pdf")]
-    st.info(f"📂 Total files found: {len(all_files)} | 📄 PDFs found: {len(pdf_files)}")
-
-    if not pdf_files:
-        st.error("Still no PDFs found after full extraction. Showing file tree:")
-        st.code("\n".join(all_files[:60]))
-        st.stop()
-
-    return EXTRACT_DIR
+    st.info(f"📄 PDFs found: {len(pdf_files)}")
+    return EXTRACT_DIR, pdf_files
 
 
-data_path = download_and_extract(FILE_ID)
+data_path, pdf_files = download_and_extract(FILE_ID)
 
 # ==========================================================
-# LOAD DOCUMENTS
+# OCR TEXT EXTRACTION
 # ==========================================================
+def extract_text_from_pdf(pdf_path):
+    """Try direct text extraction first, fall back to OCR if needed."""
+    text = ""
+
+    # Attempt 1: direct text layer via PyMuPDF
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            t = page.get_text()
+            if t:
+                text += t + "\n"
+        doc.close()
+    except Exception:
+        pass
+
+    if len(text.strip()) > 100:
+        return text
+
+    # Attempt 2: OCR via pytesseract
+    text = ""
+    try:
+        doc = fitz.open(pdf_path)
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+            page_text = pytesseract.image_to_string(img, lang="eng")
+            text += page_text + "\n"
+        doc.close()
+    except Exception:
+        pass
+
+    return text
+
+
 @st.cache_resource
-def load_documents(folder):
+def load_documents_with_ocr(pdf_file_list):
     docs = []
+    total = len(pdf_file_list)
+    progress = st.progress(0, text="Extracting text from PDFs via OCR...")
 
-    for root, _, files in os.walk(folder):
-        for file in files:
-            if file.lower().endswith(".pdf"):
-                path = os.path.join(root, file)
-                try:
-                    reader = PdfReader(path)
-                    text = ""
-                    for page in reader.pages:
-                        t = page.extract_text()
-                        if t:
-                            text += t + "\n"
+    for i, path in enumerate(pdf_file_list):
+        file = os.path.basename(path)
+        try:
+            text = extract_text_from_pdf(path)
+            if text.strip():
+                docs.append({"doc_id": file, "text": text})
+        except Exception as e:
+            st.warning(f"Failed on {file}: {e}")
 
-                    if text.strip():
-                        docs.append({
-                            "doc_id": file,
-                            "text": text
-                        })
-                except Exception as e:
-                    st.warning(f"Could not read {file}: {e}")
-                    continue
+        progress.progress((i + 1) / total, text=f"OCR: {i+1}/{total} — {file}")
 
+    progress.empty()
     return docs
 
 
-documents = load_documents(data_path)
+st.info("🔍 Extracting text via OCR (this takes several minutes on first run)...")
+documents = load_documents_with_ocr(pdf_files)
 
 if len(documents) == 0:
-    st.error("No text could be extracted from the PDFs. They may be scanned image-based PDFs.")
+    st.error(
+        "No text could be extracted even with OCR. "
+        "Tesseract may not be installed on this server. "
+        "Add a `packages.txt` file to your repo with the line: tesseract-ocr"
+    )
     st.stop()
 
-st.success(f"✅ Loaded {len(documents)} PDF files")
+st.success(f"✅ Loaded {len(documents)} PDF files with text")
 
 # ==========================================================
 # CHUNKING
 # ==========================================================
 @st.cache_resource
 def split_documents(docs, chunk_size, overlap):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=overlap
-    )
-
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
     chunks = []
     for doc in docs:
         pieces = splitter.split_text(doc["text"])
@@ -213,7 +216,6 @@ def split_documents(docs, chunk_size, overlap):
                 "chunk_id": f"{doc['doc_id']}_chunk_{i}",
                 "text": piece
             })
-
     return chunks
 
 
@@ -226,7 +228,7 @@ if len(all_chunks) == 0:
 st.success(f"✅ Created {len(all_chunks)} text chunks")
 
 # ==========================================================
-# BUILD VECTOR INDEX (BATCHED)
+# BUILD VECTOR INDEX
 # ==========================================================
 @st.cache_resource(show_spinner=False)
 def build_index(chunks, model_name):
@@ -239,11 +241,7 @@ def build_index(chunks, model_name):
 
     for i in range(0, total, BATCH_SIZE):
         batch = texts[i:i + BATCH_SIZE]
-        emb = embed_model.encode(
-            batch,
-            convert_to_numpy=True,
-            show_progress_bar=False
-        )
+        emb = embed_model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
         all_embeddings.append(emb)
         progress.progress(
             min((i + BATCH_SIZE) / total, 1.0),
@@ -251,7 +249,6 @@ def build_index(chunks, model_name):
         )
 
     progress.empty()
-
     embeddings = np.vstack(all_embeddings).astype("float32")
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
@@ -260,7 +257,7 @@ def build_index(chunks, model_name):
     return embed_model, index, chunks
 
 
-st.info("⚙️ Building vector index (first run may take a few minutes)...")
+st.info("⚙️ Building vector index...")
 embed_model, index, metadata = build_index(all_chunks, EMBED_MODEL_NAME)
 st.success("✅ Vector index ready")
 
@@ -305,24 +302,14 @@ def build_prompt(context_chunks, question):
 # ==========================================================
 def generate_answer(query):
     retrieved = retrieve(query)
-
     if not retrieved:
         return "No relevant information found.", []
 
     prompt = build_prompt(retrieved, query)
-
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024
-    )
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
 
     with torch.no_grad():
-        outputs = gen_model.generate(
-            **inputs,
-            max_new_tokens=256
-        )
+        outputs = gen_model.generate(**inputs, max_new_tokens=256)
 
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return answer.strip(), retrieved
