@@ -1,7 +1,5 @@
 streamlit
 PyMuPDF
-pytesseract
-Pillow
 langchain-text-splitters
 sentence-transformers
 faiss-cpu
