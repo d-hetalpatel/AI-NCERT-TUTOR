@@ -26,7 +26,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 FILE_ID = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
 ZIP_PATH = f"ncert.zip"
-EXTRACT_DIR = f"ncrt subject"
+EXTRACT_DIR = f"ncert"
 
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
