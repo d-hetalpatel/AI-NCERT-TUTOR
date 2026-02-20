@@ -291,19 +291,3 @@ if query:
     for i, chunk in enumerate(retrieved_chunks):
         with st.expander(f"Chunk {i + 1} — {chunk['doc_id']}"):
             st.write(chunk["text"])
-```
-
----
-
-**requirements.txt** — replace yours with this:
-```
-streamlit
-pypdf
-langchain-text-splitters
-sentence-transformers
-faiss-cpu
-torch
-transformers
-gdown
-requests
-numpy
