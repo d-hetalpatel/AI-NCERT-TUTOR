@@ -13,9 +13,13 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 # ==========================================================
 # CONFIG
 # ==========================================================
-FILE_ID = "1toFD-1u6BSpdDU-cop12nne2ysPgPHM0"
-ZIP_PATH = "ncert.zip"
-EXTRACT_DIR = "ncert_extracted"
+#FILE_ID = "1toFD-1u6BSpdDU-cop12nne2ysPgPHM0"
+#ZIP_PATH = "ncert.zip"
+#EXTRACT_DIR = "ncert_extracted"
+
+FILE_ID = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
+ZIP_PATH = f"ncert_{FILE_ID}.zip"
+EXTRACT_DIR = f"ncert_extracted_{FILE_ID}"
 
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
