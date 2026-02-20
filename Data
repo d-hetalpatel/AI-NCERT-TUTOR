@@ -1,0 +1,2 @@
+import zipfile
+ip_file= (../data/ncrt subject.zip)
