@@ -33,6 +33,28 @@ st.title("📘 NCERT AI Tutor")
 st.caption("Ask questions from NCERT textbooks using Retrieval-Augmented Generation")
 
 # ==========================================================
+# RECURSIVE ZIP EXTRACTOR
+# ==========================================================
+def extract_all_zips(folder):
+    """Recursively extract any ZIP files found inside a folder."""
+    found_new = True
+    while found_new:
+        found_new = False
+        for root, _, files in os.walk(folder):
+            for file in files:
+                if file.lower().endswith(".zip"):
+                    zip_path = os.path.join(root, file)
+                    # Extract into a subfolder named after the zip (without extension)
+                    extract_to = os.path.join(root, os.path.splitext(file)[0])
+                    if not os.path.exists(extract_to):
+                        try:
+                            with zipfile.ZipFile(zip_path, "r") as zf:
+                                zf.extractall(extract_to)
+                            found_new = True  # keep looping in case of deeper nesting
+                        except Exception as e:
+                            st.warning(f"Could not extract {file}: {e}")
+
+# ==========================================================
 # DOWNLOAD + EXTRACT
 # ==========================================================
 @st.cache_resource
@@ -58,7 +80,6 @@ def download_and_extract(file_id):
                 try:
                     session = requests.Session()
                     URL = "https://drive.google.com/uc?export=download"
-
                     response = session.get(URL, params={"id": file_id}, stream=True)
 
                     token = next(
@@ -85,7 +106,6 @@ def download_and_extract(file_id):
                         raise ValueError("Downloaded file too small — likely an HTML error page.")
 
                     st.success("Downloaded via fallback method.")
-                    success = True
 
                 except Exception as e2:
                     st.error(
@@ -96,42 +116,39 @@ def download_and_extract(file_id):
                     )
                     st.stop()
 
-    # Validate it's actually a zip before extracting
+    # Validate ZIP
     if not zipfile.is_zipfile(ZIP_PATH):
         os.remove(ZIP_PATH)
         st.error(
             "The downloaded file is not a valid ZIP. "
-            "Google likely blocked the download and returned an HTML page. "
-            "Please manually download the file from Google Drive and place it "
-            f"as `{ZIP_PATH}` next to app.py, then rerun."
+            "Google likely blocked the download. "
+            "Please manually download and place it as `ncert.zip` next to app.py."
         )
         st.stop()
 
+    # Extract outer ZIP
     if not os.path.exists(EXTRACT_DIR):
-        with st.spinner("Extracting ZIP..."):
+        with st.spinner("Extracting outer ZIP..."):
             with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
                 zip_ref.extractall(EXTRACT_DIR)
 
-    # Debug: show what was extracted
-    all_extracted = []
-    for root, dirs, files in os.walk(EXTRACT_DIR):
+    # Recursively extract all inner ZIPs (subject ZIPs containing the actual PDFs)
+    with st.spinner("Extracting inner subject ZIPs..."):
+        extract_all_zips(EXTRACT_DIR)
+
+    # Count PDFs after full extraction
+    all_files = []
+    for root, _, files in os.walk(EXTRACT_DIR):
         for f in files:
-            all_extracted.append(os.path.join(root, f))
+            all_files.append(os.path.join(root, f))
 
-    st.info(f"📂 Total files extracted: {len(all_extracted)}")
+    pdf_files = [f for f in all_files if f.lower().endswith(".pdf")]
+    st.info(f"📂 Total files found: {len(all_files)} | 📄 PDFs found: {len(pdf_files)}")
 
-    pdf_files = [f for f in all_extracted if f.lower().endswith(".pdf")]
-    st.info(f"📄 PDF files found: {len(pdf_files)}")
-
-    if pdf_files:
-        st.success("Sample PDFs found:\n" + "\n".join(pdf_files[:5]))
-    else:
-        st.warning(
-            "No PDF files found after extraction. "
-            "Showing full extracted file tree for debugging:"
-        )
-        tree_preview = "\n".join(all_extracted[:50])
-        st.code(tree_preview)
+    if not pdf_files:
+        st.error("Still no PDFs found after full extraction. Showing file tree:")
+        st.code("\n".join(all_files[:60]))
+        st.stop()
 
     return EXTRACT_DIR
 
@@ -139,7 +156,7 @@ def download_and_extract(file_id):
 data_path = download_and_extract(FILE_ID)
 
 # ==========================================================
-# LOAD DOCUMENTS  
+# LOAD DOCUMENTS
 # ==========================================================
 @st.cache_resource
 def load_documents(folder):
@@ -172,11 +189,7 @@ def load_documents(folder):
 documents = load_documents(data_path)
 
 if len(documents) == 0:
-    st.error(
-        "No PDF files were loaded. This means the ZIP extracted successfully "
-        "but either contains no PDFs, or they are in an unexpected folder structure. "
-        "Check the file tree shown above to understand the ZIP contents."
-    )
+    st.error("No text could be extracted from the PDFs. They may be scanned image-based PDFs.")
     st.stop()
 
 st.success(f"✅ Loaded {len(documents)} PDF files")
@@ -207,7 +220,7 @@ def split_documents(docs, chunk_size, overlap):
 all_chunks = split_documents(documents, CHUNK_SIZE, CHUNK_OVERLAP)
 
 if len(all_chunks) == 0:
-    st.error("No text chunks were created. The PDFs may be scanned images with no extractable text.")
+    st.error("No text chunks were created.")
     st.stop()
 
 st.success(f"✅ Created {len(all_chunks)} text chunks")
@@ -240,7 +253,6 @@ def build_index(chunks, model_name):
     progress.empty()
 
     embeddings = np.vstack(all_embeddings).astype("float32")
-
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
