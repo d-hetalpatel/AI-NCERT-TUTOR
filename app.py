@@ -7,9 +7,6 @@ import torch
 import requests
 import gdown
 import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
-import io
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -25,12 +22,11 @@ CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-GEN_MODEL_NAME = "google/flan-t5-small"
+GEN_MODEL_NAME = "google/flan-t5-base"
 
-RETRIEVE_K = 20        # broad candidate pool fetched from FAISS
-RERANK_TOP_K = 6       # top chunks after cross-encoder reranking passed to generator
+RETRIEVE_K = 20
+RERANK_TOP_K = 6
 BATCH_SIZE = 64
-OCR_DPI = 200
 
 # ==========================================================
 # PAGE CONFIG
@@ -68,7 +64,6 @@ def download_and_extract(file_id):
     if not os.path.exists(ZIP_PATH):
         with st.spinner("Downloading NCERT dataset..."):
             success = False
-
             try:
                 gdown.download(id=file_id, output=ZIP_PATH, quiet=False, fuzzy=True)
                 success = os.path.exists(ZIP_PATH) and os.path.getsize(ZIP_PATH) > 10000
@@ -80,7 +75,6 @@ def download_and_extract(file_id):
                     session = requests.Session()
                     URL = "https://drive.google.com/uc?export=download"
                     response = session.get(URL, params={"id": file_id}, stream=True)
-
                     token = next(
                         (v for k, v in response.cookies.items() if k.startswith("download_warning")),
                         None
@@ -92,15 +86,12 @@ def download_and_extract(file_id):
                             f"https://drive.google.com/uc?id={file_id}&export=download&confirm=t",
                             stream=True
                         )
-
                     with open(ZIP_PATH, "wb") as f:
                         for chunk in response.iter_content(chunk_size=32768):
                             if chunk:
                                 f.write(chunk)
-
                     if not os.path.exists(ZIP_PATH) or os.path.getsize(ZIP_PATH) < 10000:
                         raise ValueError("Downloaded file too small.")
-
                 except Exception as e2:
                     st.error(f"Both download methods failed.\n\nError: {e2}")
                     st.stop()
@@ -131,77 +122,44 @@ def download_and_extract(file_id):
 data_path, pdf_files = download_and_extract(FILE_ID)
 
 # ==========================================================
-# OCR TEXT EXTRACTION
+# LOAD DOCUMENTS via PyMuPDF (no OCR needed)
 # ==========================================================
-def extract_text_from_pdf(pdf_path):
-    """Try direct text extraction first, fall back to OCR if needed."""
-    text = ""
-
-    try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            t = page.get_text()
-            if t:
-                text += t + "\n"
-        doc.close()
-    except Exception:
-        pass
-
-    if len(text.strip()) > 100:
-        return text
-
-    # Fallback: OCR via pytesseract
-    text = ""
-    try:
-        doc = fitz.open(pdf_path)
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
-            pix = page.get_pixmap(matrix=mat)
-            img_data = pix.tobytes("png")
-            img = Image.open(io.BytesIO(img_data))
-            page_text = pytesseract.image_to_string(img, lang="eng")
-            text += page_text + "\n"
-        doc.close()
-    except Exception:
-        pass
-
-    return text
-
-
 @st.cache_resource
-def load_documents_with_ocr(pdf_file_list):
+def load_documents(pdf_file_list):
     docs = []
     total = len(pdf_file_list)
-    progress = st.progress(0, text="Extracting text from PDFs via OCR...")
+    progress = st.progress(0, text="Reading PDFs...")
 
     for i, path in enumerate(pdf_file_list):
         file = os.path.basename(path)
         try:
-            text = extract_text_from_pdf(path)
+            doc = fitz.open(path)
+            text = ""
+            for page in doc:
+                t = page.get_text()
+                if t:
+                    text += t + "\n"
+            doc.close()
+
             if text.strip():
                 docs.append({"doc_id": file, "text": text})
         except Exception as e:
-            st.warning(f"Failed on {file}: {e}")
+            st.warning(f"Could not read {file}: {e}")
 
-        progress.progress((i + 1) / total, text=f"OCR: {i+1}/{total} — {file}")
+        progress.progress((i + 1) / total, text=f"Reading: {i+1}/{total} — {file}")
 
     progress.empty()
     return docs
 
 
-st.info("🔍 Extracting text via OCR (this takes several minutes on first run)...")
-documents = load_documents_with_ocr(pdf_files)
+st.info("📖 Reading PDFs...")
+documents = load_documents(pdf_files)
 
 if len(documents) == 0:
-    st.error(
-        "No text could be extracted even with OCR. "
-        "Tesseract may not be installed on this server. "
-        "Add a `packages.txt` file to your repo with the line: tesseract-ocr"
-    )
+    st.error("No text could be extracted from the PDFs.")
     st.stop()
 
-st.success(f"✅ Loaded {len(documents)} PDF files with text")
+st.success(f"✅ Loaded {len(documents)} PDF files")
 
 # ==========================================================
 # CHUNKING
@@ -230,7 +188,7 @@ if len(all_chunks) == 0:
 st.success(f"✅ Created {len(all_chunks)} text chunks")
 
 # ==========================================================
-# BUILD VECTOR INDEX  (cosine similarity via IndexFlatIP + L2 normalisation)
+# BUILD VECTOR INDEX (cosine similarity)
 # ==========================================================
 @st.cache_resource(show_spinner=False)
 def build_index(chunks, model_name):
@@ -252,23 +210,20 @@ def build_index(chunks, model_name):
 
     progress.empty()
     embeddings = np.vstack(all_embeddings).astype("float32")
-
-    # L2-normalise → inner product == cosine similarity
     faiss.normalize_L2(embeddings)
-
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)   # Inner Product (cosine after normalisation)
+    index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
     return embed_model, index, chunks
 
 
-st.info("⚙️ Building vector index (cosine similarity)...")
+st.info("⚙️ Building vector index...")
 embed_model, faiss_index, metadata = build_index(all_chunks, EMBED_MODEL_NAME)
 st.success("✅ Vector index ready")
 
 # ==========================================================
-# LOAD CROSS-ENCODER RERANKER
+# CROSS-ENCODER RERANKER
 # ==========================================================
 @st.cache_resource
 def load_reranker(model_name):
@@ -279,7 +234,7 @@ reranker = load_reranker(RERANK_MODEL_NAME)
 st.success("✅ Cross-encoder reranker loaded")
 
 # ==========================================================
-# LOAD GENERATION MODEL
+# GENERATION MODEL
 # ==========================================================
 @st.cache_resource
 def load_generator(model_name):
@@ -293,41 +248,38 @@ tokenizer, gen_model = load_generator(GEN_MODEL_NAME)
 st.success("✅ Generation model loaded")
 
 # ==========================================================
-# RETRIEVAL  →  RERANKING  →  TOP-K SELECTION
+# RETRIEVAL → RERANKING
 # ==========================================================
 def retrieve_and_rerank(query):
-    # Step 1: embed query (normalise for cosine similarity)
     q_emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(q_emb)
 
-    # Step 2: fetch broad candidate pool from FAISS
     _, I = faiss_index.search(q_emb, RETRIEVE_K)
     candidates = [metadata[i] for i in I[0] if i < len(metadata)]
 
     if not candidates:
         return []
 
-    # Step 3: cross-encoder reranking — score every (query, chunk) pair
     pairs = [[query, c["text"]] for c in candidates]
-    scores = reranker.predict(pairs)                 # shape: (RETRIEVE_K,)
-
-    # Step 4: sort by reranker score descending, keep top RERANK_TOP_K
+    scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    top_chunks = [chunk for _, chunk in ranked[:RERANK_TOP_K]]
-
-    return top_chunks
+    return [chunk for _, chunk in ranked[:RERANK_TOP_K]]
 
 # ==========================================================
 # PROMPT BUILDER
 # ==========================================================
 def build_prompt(context_chunks, question):
-    context = "\n\n".join([c["text"] for c in context_chunks])
+    context_parts = []
+    for i, c in enumerate(context_chunks):
+        context_parts.append(f"[Passage {i+1}]\n{c['text']}")
+    context = "\n\n".join(context_parts)
+
     return (
-        f"You are an AI tutor specializing in NCERT textbooks.\n"
-        f"Answer ONLY using the provided context.\n"
-        f"Be clear and concise.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question:\n{question}\n\n"
+        f"You are a helpful NCERT textbook tutor.\n"
+        f"Read the passages below carefully and answer the question using ONLY information from the passages.\n"
+        f"Give a complete, accurate answer in 2-4 sentences. Do not copy the question back.\n\n"
+        f"{context}\n\n"
+        f"Question: {question}\n"
         f"Answer:"
     )
 
@@ -340,10 +292,16 @@ def generate_answer(query):
         return "No relevant information found.", []
 
     prompt = build_prompt(retrieved, query)
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536)
 
     with torch.no_grad():
-        outputs = gen_model.generate(**inputs, max_new_tokens=256)
+        outputs = gen_model.generate(
+            **inputs,
+            max_new_tokens=300,
+            num_beams=4,
+            early_stopping=True,
+            no_repeat_ngram_size=3
+        )
 
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return answer.strip(), retrieved
@@ -351,16 +309,15 @@ def generate_answer(query):
 # ==========================================================
 # USER INTERFACE
 # ==========================================================
-st.markdown("---")
-
 with st.sidebar:
     st.header("⚙️ Retrieval Settings")
     st.metric("Candidate pool (FAISS)", RETRIEVE_K)
-    st.metric("After reranking (cross-encoder)", RERANK_TOP_K)
+    st.metric("After reranking", RERANK_TOP_K)
     st.caption(f"Embed model: `{EMBED_MODEL_NAME}`")
     st.caption(f"Reranker: `{RERANK_MODEL_NAME}`")
     st.caption(f"Generator: `{GEN_MODEL_NAME}`")
 
+st.markdown("---")
 query = st.text_input("💬 Ask your question from NCERT:", placeholder="e.g. What is photosynthesis?")
 
 if query:
@@ -370,7 +327,7 @@ if query:
     st.markdown("## 📖 Answer")
     st.write(answer)
 
-    st.markdown(f"## 📚 Top {RERANK_TOP_K} Reranked Chunks Used to Generate the Answer")
+    st.markdown(f"## 📚 Top {RERANK_TOP_K} Reranked Chunks")
     for i, chunk in enumerate(retrieved_chunks):
         with st.expander(f"Chunk {i + 1} — {chunk['doc_id']}"):
             st.write(chunk["text"])
