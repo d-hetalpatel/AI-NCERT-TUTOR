@@ -17,9 +17,13 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 #ZIP_PATH = "ncert.zip"
 #EXTRACT_DIR = "ncert_extracted"
 
+# ==========================================================
+# CONFIG
+# ==========================================================
 FILE_ID = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
-ZIP_PATH = f"ncert.zip"
-EXTRACT_DIR = f"ncert_extracted_{FILE_ID}"
+ZIP_PATH = "ncert_data.zip"
+EXTRACT_DIR = "ncert_data"
+
 
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
