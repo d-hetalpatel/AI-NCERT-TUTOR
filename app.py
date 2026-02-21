@@ -629,9 +629,14 @@ def build_prompt(context_chunks, question, sel_subject, sel_class):
 
     # Short, direct prompt — flan-t5 handles these better than long instructions
     return (
-        f"Context: {context}\n\n"
-        f"Based on the context above, answer this question about NCERT {subj} for {cls}:\n"
-        f"{question}\n\n"
+        #f"Context: {context}\n\n"
+        #f"Based on the context above, answer this question about NCERT {subj} for {cls}:\n"
+        #f"{question}\n\n"
+        #f"Answer:"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer using only the context above. "
+        f"Quote relevant parts of the passages in your answer.\n"
         f"Answer:"
     )
 
