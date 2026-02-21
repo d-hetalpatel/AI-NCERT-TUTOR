@@ -565,10 +565,43 @@ def auto_detect_from_question(question):
     return detected_subject, detected_class
 
 # ==========================================================
-# RETRIEVAL → FILTER → RERANK
+# HyDE — Hypothetical Document Embedding
+# Generate a fake answer with flan-t5, then embed THAT for retrieval.
+# Bridges the gap between question-space and passage-space embeddings.
+# ==========================================================
+def hypothetical_answer(question):
+    prompt = f"Write a short explanation about: {question}"
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128)
+    with torch.no_grad():
+        out = gen_model.generate(**inputs, max_new_tokens=80, num_beams=2)
+    return tokenizer.decode(out[0], skip_special_tokens=True)
+
+# ==========================================================
+# DEDUP — Remove near-duplicate chunks caused by chunk overlap
+# Prevents the same passage appearing multiple times in retrieved results.
+# ==========================================================
+def deduplicate_chunks(chunks, threshold=0.8):
+    seen, result = [], []
+    for chunk in chunks:
+        text  = clean_chunk_text(chunk["text"])
+        words = set(text.split())
+        is_dup = any(
+            len(words & set(s.split())) / max(len(words), 1) > threshold
+            for s in seen
+        )
+        if not is_dup:
+            seen.append(text)
+            result.append(chunk)
+    return result
+
+# ==========================================================
+# RETRIEVAL → FILTER → DEDUP → RERANK
 # ==========================================================
 def retrieve_and_rerank(query, sel_subject, sel_class, sel_types):
-    q_emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
+    # HyDE: embed a hypothetical answer instead of the raw question
+    # for better semantic alignment with passage embeddings
+    hyp   = hypothetical_answer(query)
+    q_emb = embed_model.encode([hyp], convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(q_emb)
 
     _, I       = faiss_index.search(q_emb, RETRIEVE_K)
@@ -587,6 +620,9 @@ def retrieve_and_rerank(query, sel_subject, sel_class, sel_types):
     if not filtered:
         st.warning("⚠️ Filters too strict — showing unfiltered results.")
         filtered = candidates
+
+    # Dedup before reranking — removes overlap-artifact near-duplicates
+    filtered = deduplicate_chunks(filtered)
 
     pairs  = [[query, clean_chunk_text(c["text"])] for c in filtered]
     scores = reranker.predict(pairs)
@@ -627,12 +663,7 @@ def build_prompt(context_chunks, question, sel_subject, sel_class):
         for i, c in enumerate(context_chunks)
     )
 
-    # Short, direct prompt — flan-t5 handles these better than long instructions
     return (
-        #f"Context: {context}\n\n"
-        #f"Based on the context above, answer this question about NCERT {subj} for {cls}:\n"
-        #f"{question}\n\n"
-        #f"Answer:"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n\n"
         f"Answer using only the context above. "
@@ -658,6 +689,15 @@ def clean_answer(text):
     return result.strip()
 
 # ==========================================================
+# HIGHLIGHT QUERY TERMS IN SOURCE TEXT
+# ==========================================================
+def highlight_terms(text, query):
+    for word in query.split():
+        if len(word) > 3:
+            text = re.sub(f"(?i)({re.escape(word)})", r"**\1**", text)
+    return text
+
+# ==========================================================
 # FULL PIPELINE
 # ==========================================================
 def generate_answer(query, sel_subject, sel_class, sel_types):
@@ -668,13 +708,12 @@ def generate_answer(query, sel_subject, sel_class, sel_types):
 
     prompt = build_prompt(retrieved, query, sel_subject, sel_class)
 
-    # Reduced max_length to leave more room for output tokens
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
 
     with torch.no_grad():
         outputs = gen_model.generate(
             **inputs,
-            max_new_tokens=512,       # increased from 300
+            max_new_tokens=512,
             min_new_tokens=50,        # force at least 50 tokens — avoids fragment answers
             num_beams=4,
             early_stopping=True,
@@ -684,12 +723,7 @@ def generate_answer(query, sel_subject, sel_class, sel_types):
 
     raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return clean_answer(raw), retrieved
-    
-def highlight_terms(text, query):
-    for word in query.split():
-        if len(word) > 3:
-            text = re.sub(f"(?i)({re.escape(word)})", r"**\1**", text)
-    return text
+
 # ==========================================================
 # UI
 # ==========================================================
@@ -731,5 +765,5 @@ if query:
         )
         with st.expander(label):
             st.caption(f"📄 `{chunk.get('doc_id','?')}`")
-            st.write(clean_chunk_text(chunk["text"]))
+            # FIX: removed duplicate st.write — only render highlighted markdown once
             st.markdown(highlight_terms(clean_chunk_text(chunk["text"]), query))
