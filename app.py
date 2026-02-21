@@ -24,33 +24,25 @@ EXTRACT_DIR   = "ncert"
 
 CHUNK_SIZE    = 1200
 CHUNK_OVERLAP = 200
+MIN_CHUNK_LEN = 100          # FIX: skip garbage chunks shorter than this after cleaning
 
 EMBED_MODEL_NAME  = "all-MiniLM-L6-v2"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 GEN_MODEL_NAME    = "google/flan-t5-base"
 
 RETRIEVE_K    = 20
-RERANK_TOP_K  = 6
+RERANK_TOP_K  = 4            # reduced from 6 so chunks fit fully in prompt
 BATCH_SIZE    = 64
 
-# Disk cache paths
 INDEX_PATH    = "faiss_index.bin"
 META_PATH     = "chunks_meta.pkl"
 HASH_PATH     = "index_hash.txt"
 
 # ==========================================================
 # SUBJECT / CLASS CONSTANTS
-# Folder names: "class 11 business studies", "class 12 polity" etc.
 # ==========================================================
-SUBJECT_LIST = [
-    "Auto",
-    "Business Studies",
-    "Economics",
-    "Polity",
-    "Psychology",
-    "Sociology",
-]
-CLASS_LIST = ["Auto", "Class 11", "Class 12"]
+SUBJECT_LIST = ["Auto", "Business Studies", "Economics", "Polity", "Psychology", "Sociology"]
+CLASS_LIST   = ["Auto", "Class 11", "Class 12"]
 
 FOLDER_SUBJECT_MAP = {
     "business studies": "Business Studies",
@@ -60,7 +52,6 @@ FOLDER_SUBJECT_MAP = {
     "sociology":        "Sociology",
 }
 
-# NCERT filename 2-letter codes (fallback if folder name unavailable)
 FILENAME_CODE_MAP = {
     "bs": "Business Studies",
     "ec": "Economics",
@@ -90,7 +81,6 @@ with st.sidebar:
         default=["theory", "definition", "example"],
         help="Filter chunks by content type detected inside the text."
     )
-
     st.divider()
     st.header("⚙️ Index")
     if st.button("🔄 Force Rebuild Index"):
@@ -99,7 +89,6 @@ with st.sidebar:
                 os.remove(p)
         st.cache_resource.clear()
         st.success("Cache cleared — refresh to rebuild.")
-
     st.divider()
     st.header("ℹ️ Model Info")
     st.caption(f"Embed: `{EMBED_MODEL_NAME}`")
@@ -166,7 +155,7 @@ def download_and_extract(file_id):
                     if not os.path.exists(ZIP_PATH) or os.path.getsize(ZIP_PATH) < 10000:
                         raise ValueError("Downloaded file too small.")
                 except Exception as e2:
-                    st.error(f"Both download methods failed.\n\nError: {e2}")
+                    st.error(f"Both download methods failed: {e2}")
                     st.stop()
 
     if not zipfile.is_zipfile(ZIP_PATH):
@@ -219,20 +208,29 @@ def parse_metadata_from_folder(folder_path):
 
 def parse_metadata_from_filename(filename):
     """
-    Fallback — decode NCERT 2-letter subject code.
-    lebs1ps.pdf → bs → Business Studies
+    Fallback — decode NCERT 2-letter subject code from filename.
+
+    FIX 1: pattern now requires digit after subject code to avoid false matches
+            e.g. leps104.pdf → 'ps' followed by '1' → Psychology (correct)
+            without fix: leps matched 'ps' but also caught wrong codes
+
+    FIX 2: chapter numbers > 20 are catalog/ISBN codes, not real chapters
+            e.g. leps104 → 104 is discarded, not stored as 'Chapter 104'
     """
     name    = filename.lower().replace(".pdf", "")
     subject = "Unknown"
     chapter = "Unknown"
 
-    m = re.match(r'^[lik]e([a-z]{2})', name)
+    # Must be followed by a digit to avoid false positives
+    m = re.match(r'^[lik]e([a-z]{2})\d', name)
     if m:
         subject = FILENAME_CODE_MAP.get(m.group(1), "Unknown")
 
-    n = re.search(r'(\d+)', name)
-    if n:
-        chapter = f"Part {n.group(1)}"
+    # Only keep plausible chapter numbers (1-20), discard catalog codes
+    numbers       = re.findall(r'\d+', name)
+    real_chapters = [n for n in numbers if int(n) <= 20]
+    if real_chapters:
+        chapter = f"Chapter {real_chapters[0]}"
 
     return subject, chapter
 
@@ -241,7 +239,10 @@ def get_full_metadata(full_path):
     folder   = os.path.dirname(full_path)
     filename = os.path.basename(full_path)
 
+    # Folder name is ground truth for class + subject
     class_level, subject = parse_metadata_from_folder(folder)
+
+    # Only use filename as fallback if folder gave nothing
     if subject == "Unknown":
         subject, _ = parse_metadata_from_filename(filename)
 
@@ -305,9 +306,9 @@ def enrich_chunk_text(chunk):
 # ==========================================================
 @st.cache_resource
 def load_documents(pdf_file_list):
-    docs   = []
-    total  = len(pdf_file_list)
-    prog   = st.progress(0, text="Reading PDFs...")
+    docs  = []
+    total = len(pdf_file_list)
+    prog  = st.progress(0, text="Reading PDFs...")
 
     for i, path in enumerate(pdf_file_list):
         file = os.path.basename(path)
@@ -322,7 +323,7 @@ def load_documents(pdf_file_list):
             if text.strip():
                 docs.append({
                     "doc_id":    file,
-                    "full_path": path,      # needed for folder-based metadata
+                    "full_path": path,
                     "text":      text
                 })
         except Exception as e:
@@ -355,7 +356,7 @@ def get_docs_hash(docs):
 docs_hash = get_docs_hash(documents)
 
 # ==========================================================
-# CHUNKING WITH FULL METADATA
+# CHUNKING WITH FULL METADATA + GARBAGE FILTER
 # ==========================================================
 def split_documents(docs, chunk_size, overlap):
     splitter = RecursiveCharacterTextSplitter(
@@ -366,6 +367,14 @@ def split_documents(docs, chunk_size, overlap):
         meta   = get_full_metadata(doc["full_path"])
         pieces = splitter.split_text(doc["text"])
         for i, piece in enumerate(pieces):
+
+            # FIX: clean first, then check length
+            # Skips blank pages, header-only pages, numbered list fragments
+            # that were showing up as empty source expanders
+            cleaned = clean_chunk_text(piece)
+            if len(cleaned) < MIN_CHUNK_LEN:
+                continue
+
             chunks.append({
                 "doc_id":       doc["doc_id"],
                 "chunk_id":     f"{doc['doc_id']}_chunk_{i}",
@@ -438,13 +447,11 @@ def load_index_safe(h):
 def build_index(docs_hash, model_name):
     embed_model = SentenceTransformer(model_name)
 
-    # Try loading from disk first — skips embedding on warm starts
     idx, chunks = load_index_safe(docs_hash)
     if idx is not None:
         st.success("⚡ Index loaded from disk instantly!")
         return embed_model, idx, chunks
 
-    # Build from scratch
     st.info("Building vector index (first run only — saved for future use)...")
     texts    = [c["text"] for c in all_chunks]
     emb_list = []
@@ -463,7 +470,7 @@ def build_index(docs_hash, model_name):
     prog.empty()
 
     embeddings = np.vstack(emb_list).astype("float32")
-    faiss.normalize_L2(embeddings)          # cosine similarity via inner product
+    faiss.normalize_L2(embeddings)
 
     idx = faiss.IndexFlatIP(embeddings.shape[1])
     idx.add(embeddings)
@@ -476,7 +483,6 @@ def build_index(docs_hash, model_name):
 st.info("⚙️ Loading vector index...")
 embed_model, faiss_index, metadata = build_index(docs_hash, EMBED_MODEL_NAME)
 
-# Update sidebar index size now that index exists
 with st.sidebar:
     if os.path.exists(INDEX_PATH):
         st.caption(f"📦 Index: {os.path.getsize(INDEX_PATH)/1e6:.1f} MB")
@@ -494,7 +500,7 @@ reranker = load_reranker(RERANK_MODEL_NAME)
 st.success("✅ Cross-encoder reranker loaded")
 
 # ==========================================================
-# GENERATION MODEL
+# GENERATION MODEL (flan-t5-base)
 # ==========================================================
 @st.cache_resource
 def load_generator(model_name):
@@ -562,18 +568,15 @@ def auto_detect_from_question(question):
 # RETRIEVAL → FILTER → RERANK
 # ==========================================================
 def retrieve_and_rerank(query, sel_subject, sel_class, sel_types):
-    # Step 1 — embed + normalize query
     q_emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(q_emb)
 
-    # Step 2 — fetch RETRIEVE_K candidates from FAISS
     _, I       = faiss_index.search(q_emb, RETRIEVE_K)
     candidates = [metadata[i] for i in I[0] if i < len(metadata)]
 
     if not candidates:
         return []
 
-    # Step 3 — apply sidebar filters
     filtered = []
     for c in candidates:
         if sel_subject != "Auto" and c["subject"]     != sel_subject: continue
@@ -585,7 +588,6 @@ def retrieve_and_rerank(query, sel_subject, sel_class, sel_types):
         st.warning("⚠️ Filters too strict — showing unfiltered results.")
         filtered = candidates
 
-    # Step 4 — cross-encoder reranking
     pairs  = [[query, clean_chunk_text(c["text"])] for c in filtered]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, filtered), key=lambda x: x[0], reverse=True)
@@ -614,31 +616,22 @@ def extract_context_metadata(chunks, question, sel_subject, sel_class):
 
 # ==========================================================
 # PROMPT BUILDER
+# flan-t5 works best with short, direct prompts — keep context tight
 # ==========================================================
 def build_prompt(context_chunks, question, sel_subject, sel_class):
     subj, cls = extract_context_metadata(context_chunks, question, sel_subject, sel_class)
 
-    grounding = (
-        f"You are an expert NCERT tutor helping a {cls} student with {subj}."
-        if subj != "NCERT"
-        else f"You are an expert NCERT tutor for {cls} students."
-    )
-
-    context = "\n\n---\n\n".join(
-        f"[Passage {i+1}]\n{enrich_chunk_text(c)}"
+    # Use only cleaned text (no metadata prefix) to save tokens for flan-t5
+    context = "\n\n".join(
+        f"Passage {i+1}: {clean_chunk_text(c['text'])}"
         for i, c in enumerate(context_chunks)
     )
 
+    # Short, direct prompt — flan-t5 handles these better than long instructions
     return (
-        f"{grounding}\n\n"
-        f"Read the passages below and answer the question using ONLY information from the passages.\n"
-        f"Rules:\n"
-        f"1. If clearly present — answer simply and accurately in 2-4 sentences.\n"
-        f"2. If partially present — answer what you can and note what is missing.\n"
-        f"3. If NOT present — say exactly: \"I don't know based on the provided context.\"\n"
-        f"4. Never invent facts, definitions, or data not in the passages.\n\n"
-        f"{context}\n\n"
-        f"Question: {question}\n"
+        f"Context: {context}\n\n"
+        f"Based on the context above, answer this question about NCERT {subj} for {cls}:\n"
+        f"{question}\n\n"
         f"Answer:"
     )
 
@@ -669,15 +662,19 @@ def generate_answer(query, sel_subject, sel_class, sel_types):
         return "No relevant information found.", []
 
     prompt = build_prompt(retrieved, query, sel_subject, sel_class)
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536)
+
+    # Reduced max_length to leave more room for output tokens
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
 
     with torch.no_grad():
         outputs = gen_model.generate(
             **inputs,
-            max_new_tokens=300,
+            max_new_tokens=512,       # increased from 300
+            min_new_tokens=50,        # force at least 50 tokens — avoids fragment answers
             num_beams=4,
             early_stopping=True,
-            no_repeat_ngram_size=3
+            no_repeat_ngram_size=3,
+            length_penalty=2.0        # penalise short answers
         )
 
     raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -689,7 +686,7 @@ def generate_answer(query, sel_subject, sel_class, sel_types):
 st.markdown("---")
 query = st.text_input(
     "💬 Ask your question:",
-    placeholder="e.g. What is the role of motivation in directing? / Explain price elasticity"
+    placeholder="e.g. What are the features of planning? / Explain price elasticity of demand"
 )
 
 if query:
@@ -698,7 +695,6 @@ if query:
             query, selected_subject, selected_class, selected_types
         )
 
-    # Show auto-detection banner only when sidebar left on Auto
     if selected_subject == "Auto" or selected_class == "Auto":
         subj_used, cls_used = extract_context_metadata(
             ret_chunks, query, selected_subject, selected_class
@@ -708,14 +704,12 @@ if query:
             f"*Use sidebar filters to override if wrong.*"
         )
 
-    # Answer
     st.markdown("## 📖 Answer")
     if "don't know" in answer.lower():
         st.warning(answer)
     else:
         st.success(answer)
 
-    # Sources
     st.markdown(f"## 📚 Top {RERANK_TOP_K} Sources (After Reranking)")
     for i, chunk in enumerate(ret_chunks):
         label = (
