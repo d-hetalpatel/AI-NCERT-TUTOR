@@ -1,6 +1,10 @@
 import streamlit as st
 import os
+import re
 import zipfile
+import pickle
+import hashlib
+import json
 import numpy as np
 import faiss
 import torch
@@ -14,39 +18,108 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 # ==========================================================
 # CONFIG
 # ==========================================================
-FILE_ID = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
-ZIP_PATH = "ncert.zip"
-EXTRACT_DIR = "ncert"
+FILE_ID       = "1zrJOzLjnOIBuVVbTW0FsX38V6xIlpjV2"
+ZIP_PATH      = "ncert.zip"
+EXTRACT_DIR   = "ncert"
 
-CHUNK_SIZE = 1200
+CHUNK_SIZE    = 1200
 CHUNK_OVERLAP = 200
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"
 
-RETRIEVE_K = 20
-RERANK_TOP_K = 6
-BATCH_SIZE = 64
+EMBED_MODEL_NAME  = "all-MiniLM-L6-v2"
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+GEN_MODEL_NAME    = "google/flan-t5-base"
+
+RETRIEVE_K    = 20
+RERANK_TOP_K  = 6
+BATCH_SIZE    = 64
+
+# Disk cache paths
+INDEX_PATH    = "faiss_index.bin"
+META_PATH     = "chunks_meta.pkl"
+HASH_PATH     = "index_hash.txt"
+
+# ==========================================================
+# SUBJECT / CLASS CONSTANTS
+# Folder names: "class 11 business studies", "class 12 polity" etc.
+# ==========================================================
+SUBJECT_LIST = [
+    "Auto",
+    "Business Studies",
+    "Economics",
+    "Polity",
+    "Psychology",
+    "Sociology",
+]
+CLASS_LIST = ["Auto", "Class 11", "Class 12"]
+
+FOLDER_SUBJECT_MAP = {
+    "business studies": "Business Studies",
+    "economics":        "Economics",
+    "polity":           "Polity",
+    "psychology":       "Psychology",
+    "sociology":        "Sociology",
+}
+
+# NCERT filename 2-letter codes (fallback if folder name unavailable)
+FILENAME_CODE_MAP = {
+    "bs": "Business Studies",
+    "ec": "Economics",
+    "po": "Polity",
+    "ps": "Psychology",
+    "so": "Sociology",
+}
 
 # ==========================================================
 # PAGE CONFIG
 # ==========================================================
 st.set_page_config(page_title="NCERT AI Tutor", layout="wide")
 st.title("📘 NCERT AI Tutor")
-st.caption("Ask questions from NCERT textbooks using Retrieval-Augmented Generation")
+st.caption("Class 11 & 12 — Business Studies · Economics · Polity · Psychology · Sociology")
+
+# ==========================================================
+# SIDEBAR
+# ==========================================================
+with st.sidebar:
+    st.header("📚 Filter Your Search")
+    st.caption("Leave as 'Auto' to search all books.")
+    selected_class   = st.selectbox("Class",   CLASS_LIST,   index=0)
+    selected_subject = st.selectbox("Subject", SUBJECT_LIST, index=0)
+    selected_types   = st.multiselect(
+        "Content Type",
+        ["theory", "definition", "example", "exercise", "summary", "activity"],
+        default=["theory", "definition", "example"],
+        help="Filter chunks by content type detected inside the text."
+    )
+
+    st.divider()
+    st.header("⚙️ Index")
+    if st.button("🔄 Force Rebuild Index"):
+        for p in [INDEX_PATH, META_PATH, HASH_PATH]:
+            if os.path.exists(p):
+                os.remove(p)
+        st.cache_resource.clear()
+        st.success("Cache cleared — refresh to rebuild.")
+
+    st.divider()
+    st.header("ℹ️ Model Info")
+    st.caption(f"Embed: `{EMBED_MODEL_NAME}`")
+    st.caption(f"Reranker: `{RERANK_MODEL_NAME}`")
+    st.caption(f"Generator: `{GEN_MODEL_NAME}`")
+    st.metric("FAISS candidates", RETRIEVE_K)
+    st.metric("After reranking",  RERANK_TOP_K)
 
 # ==========================================================
 # RECURSIVE ZIP EXTRACTOR
 # ==========================================================
 def extract_all_zips(folder):
-    """Recursively extract any ZIP files found inside a folder."""
+    """Recursively extract any nested ZIP files (subject folders)."""
     found_new = True
     while found_new:
         found_new = False
         for root, _, files in os.walk(folder):
             for file in files:
                 if file.lower().endswith(".zip"):
-                    zip_path = os.path.join(root, file)
+                    zip_path   = os.path.join(root, file)
                     extract_to = os.path.join(root, os.path.splitext(file)[0])
                     if not os.path.exists(extract_to):
                         try:
@@ -72,12 +145,12 @@ def download_and_extract(file_id):
 
             if not success:
                 try:
-                    session = requests.Session()
-                    URL = "https://drive.google.com/uc?export=download"
+                    session  = requests.Session()
+                    URL      = "https://drive.google.com/uc?export=download"
                     response = session.get(URL, params={"id": file_id}, stream=True)
-                    token = next(
-                        (v for k, v in response.cookies.items() if k.startswith("download_warning")),
-                        None
+                    token    = next(
+                        (v for k, v in response.cookies.items()
+                         if k.startswith("download_warning")), None
                     )
                     if token:
                         response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True)
@@ -98,23 +171,22 @@ def download_and_extract(file_id):
 
     if not zipfile.is_zipfile(ZIP_PATH):
         os.remove(ZIP_PATH)
-        st.error("Downloaded file is not a valid ZIP. Please download manually and place as `ncert.zip`.")
+        st.error("Downloaded file is not a valid ZIP.")
         st.stop()
 
     if not os.path.exists(EXTRACT_DIR):
         with st.spinner("Extracting outer ZIP..."):
-            with zipfile.ZipFile(ZIP_PATH, "r") as zip_ref:
-                zip_ref.extractall(EXTRACT_DIR)
+            with zipfile.ZipFile(ZIP_PATH, "r") as zf:
+                zf.extractall(EXTRACT_DIR)
 
-    with st.spinner("Extracting inner subject ZIPs..."):
+    with st.spinner("Extracting subject ZIPs..."):
         extract_all_zips(EXTRACT_DIR)
 
-    pdf_files = []
-    for root, _, files in os.walk(EXTRACT_DIR):
-        for f in files:
-            if f.lower().endswith(".pdf"):
-                pdf_files.append(os.path.join(root, f))
-
+    pdf_files = [
+        os.path.join(root, f)
+        for root, _, files in os.walk(EXTRACT_DIR)
+        for f in files if f.lower().endswith(".pdf")
+    ]
     st.info(f"📄 PDFs found: {len(pdf_files)}")
     return EXTRACT_DIR, pdf_files
 
@@ -122,105 +194,293 @@ def download_and_extract(file_id):
 data_path, pdf_files = download_and_extract(FILE_ID)
 
 # ==========================================================
-# LOAD DOCUMENTS via PyMuPDF (no OCR needed)
+# METADATA HELPERS
+# ==========================================================
+def parse_metadata_from_folder(folder_path):
+    """
+    Primary source — reads folder name directly.
+    'class 11 business studies' → Class 11, Business Studies
+    """
+    parts       = folder_path.lower().replace("\\", "/").split("/")
+    class_level = "Unknown"
+    subject     = "Unknown"
+
+    for part in parts:
+        m = re.search(r'class\s*(1[12])', part)
+        if m:
+            class_level = f"Class {m.group(1)}"
+        for keyword, canonical in FOLDER_SUBJECT_MAP.items():
+            if keyword in part:
+                subject = canonical
+                break
+
+    return class_level, subject
+
+
+def parse_metadata_from_filename(filename):
+    """
+    Fallback — decode NCERT 2-letter subject code.
+    lebs1ps.pdf → bs → Business Studies
+    """
+    name    = filename.lower().replace(".pdf", "")
+    subject = "Unknown"
+    chapter = "Unknown"
+
+    m = re.match(r'^[lik]e([a-z]{2})', name)
+    if m:
+        subject = FILENAME_CODE_MAP.get(m.group(1), "Unknown")
+
+    n = re.search(r'(\d+)', name)
+    if n:
+        chapter = f"Part {n.group(1)}"
+
+    return subject, chapter
+
+
+def get_full_metadata(full_path):
+    folder   = os.path.dirname(full_path)
+    filename = os.path.basename(full_path)
+
+    class_level, subject = parse_metadata_from_folder(folder)
+    if subject == "Unknown":
+        subject, _ = parse_metadata_from_filename(filename)
+
+    _, chapter = parse_metadata_from_filename(filename)
+
+    return {
+        "filename":    filename,
+        "subject":     subject,
+        "class_level": class_level,
+        "chapter":     chapter,
+    }
+
+# ==========================================================
+# SECTION TYPE DETECTION
+# ==========================================================
+def detect_section_type(text):
+    t = text.lower()
+    if any(k in t for k in ["exercise", "very short answer", "answer the following",
+                             "fill in the blank", "true or false", "questions for practice"]):
+        return "exercise"
+    if any(k in t for k in ["is defined as", "is called", "refers to",
+                             "may be defined", "can be defined", "definition"]):
+        return "definition"
+    if any(k in t for k in ["for example", "for instance", "e.g.",
+                             "case study", "let us understand", "illustration"]):
+        return "example"
+    if any(k in t for k in ["summary", "key points", "in this chapter",
+                             "we have learnt", "let us recapitulate"]):
+        return "summary"
+    if any(k in t for k in ["activity", "project", "do it yourself",
+                             "think and discuss", "intext question"]):
+        return "activity"
+    return "theory"
+
+# ==========================================================
+# CLEAN TEXT
+# ==========================================================
+def clean_chunk_text(text):
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'-\n', '', text)
+    text = re.sub(r'\n([a-z])', r' \1', text)
+    text = re.sub(r'\n?\d+\s*\n', '\n', text)
+    text = re.sub(r'Reprint \d{4}-\d{2}', '', text)
+    text = re.sub(r'Prelims\.indd\s*\d+.*', '', text)
+    text = re.sub(r'[^\x20-\x7E\n]', ' ', text)
+    return text.strip()
+
+# ==========================================================
+# ENRICH CHUNK TEXT WITH METADATA HEADER
+# ==========================================================
+def enrich_chunk_text(chunk):
+    prefix = (
+        f"[{chunk['class_level']} | {chunk['subject']} | "
+        f"{chunk['chapter']} | {chunk['section_type'].upper()}]\n\n"
+    )
+    return prefix + clean_chunk_text(chunk["text"])
+
+# ==========================================================
+# LOAD DOCUMENTS via PyMuPDF
 # ==========================================================
 @st.cache_resource
 def load_documents(pdf_file_list):
-    docs = []
-    total = len(pdf_file_list)
-    progress = st.progress(0, text="Reading PDFs...")
+    docs   = []
+    total  = len(pdf_file_list)
+    prog   = st.progress(0, text="Reading PDFs...")
 
     for i, path in enumerate(pdf_file_list):
         file = os.path.basename(path)
         try:
-            doc = fitz.open(path)
-            text = ""
-            for page in doc:
-                t = page.get_text()
-                if t:
-                    text += t + "\n"
+            doc  = fitz.open(path)
+            text = "".join(
+                page.get_text() + "\n"
+                for page in doc
+                if page.get_text()
+            )
             doc.close()
-
             if text.strip():
-                docs.append({"doc_id": file, "text": text})
+                docs.append({
+                    "doc_id":    file,
+                    "full_path": path,      # needed for folder-based metadata
+                    "text":      text
+                })
         except Exception as e:
             st.warning(f"Could not read {file}: {e}")
 
-        progress.progress((i + 1) / total, text=f"Reading: {i+1}/{total} — {file}")
+        prog.progress((i + 1) / total, text=f"Reading {i+1}/{total} — {file}")
 
-    progress.empty()
+    prog.empty()
     return docs
 
 
 st.info("📖 Reading PDFs...")
 documents = load_documents(pdf_files)
 
-if len(documents) == 0:
+if not documents:
     st.error("No text could be extracted from the PDFs.")
     st.stop()
 
 st.success(f"✅ Loaded {len(documents)} PDF files")
 
 # ==========================================================
-# CHUNKING
+# STABLE HASH (cache invalidation)
 # ==========================================================
-@st.cache_resource
+def get_docs_hash(docs):
+    fp = [{"doc_id": d["doc_id"], "len": len(d["text"])}
+          for d in sorted(docs, key=lambda x: x["doc_id"])]
+    return hashlib.md5(json.dumps(fp, sort_keys=True).encode()).hexdigest()
+
+
+docs_hash = get_docs_hash(documents)
+
+# ==========================================================
+# CHUNKING WITH FULL METADATA
+# ==========================================================
 def split_documents(docs, chunk_size, overlap):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=overlap
+    )
     chunks = []
     for doc in docs:
+        meta   = get_full_metadata(doc["full_path"])
         pieces = splitter.split_text(doc["text"])
         for i, piece in enumerate(pieces):
             chunks.append({
-                "doc_id": doc["doc_id"],
-                "chunk_id": f"{doc['doc_id']}_chunk_{i}",
-                "text": piece
+                "doc_id":       doc["doc_id"],
+                "chunk_id":     f"{doc['doc_id']}_chunk_{i}",
+                "text":         piece,
+                "subject":      meta["subject"],
+                "class_level":  meta["class_level"],
+                "chapter":      meta["chapter"],
+                "section_type": detect_section_type(piece),
             })
     return chunks
 
 
-all_chunks = split_documents(documents, CHUNK_SIZE, CHUNK_OVERLAP)
+@st.cache_resource
+def split_documents_cached(docs_hash, chunk_size, overlap):
+    # docs_hash in signature → cache busts automatically when PDFs change
+    return split_documents(documents, chunk_size, overlap)
 
-if len(all_chunks) == 0:
+
+all_chunks = split_documents_cached(docs_hash, CHUNK_SIZE, CHUNK_OVERLAP)
+
+if not all_chunks:
     st.error("No text chunks were created.")
     st.stop()
 
 st.success(f"✅ Created {len(all_chunks)} text chunks")
 
+# Sanity check — show detected subjects/classes
+det_subjects = sorted(set(c["subject"]     for c in all_chunks if c["subject"]     != "Unknown"))
+det_classes  = sorted(set(c["class_level"] for c in all_chunks if c["class_level"] != "Unknown"))
+if det_subjects:
+    st.info(f"📖 Detected → {', '.join(det_classes)} | {', '.join(det_subjects)}")
+
 # ==========================================================
-# BUILD VECTOR INDEX (cosine similarity)
+# FAISS DISK PERSISTENCE HELPERS
+# ==========================================================
+def index_is_valid(h):
+    if not all(os.path.exists(p) for p in [INDEX_PATH, META_PATH, HASH_PATH]):
+        return False
+    with open(HASH_PATH) as f:
+        return f.read().strip() == h
+
+
+def save_index(idx, chunks, h):
+    faiss.write_index(idx, INDEX_PATH)
+    with open(META_PATH, "wb") as f:
+        pickle.dump(chunks, f)
+    with open(HASH_PATH, "w") as f:
+        f.write(h)
+
+
+def load_index_safe(h):
+    try:
+        if index_is_valid(h):
+            idx = faiss.read_index(INDEX_PATH)
+            with open(META_PATH, "rb") as f:
+                chunks = pickle.load(f)
+            assert idx.ntotal > 0 and len(chunks) > 0
+            return idx, chunks
+    except Exception as e:
+        st.warning(f"Saved index invalid ({e}), rebuilding...")
+        for p in [INDEX_PATH, META_PATH, HASH_PATH]:
+            if os.path.exists(p):
+                os.remove(p)
+    return None, None
+
+# ==========================================================
+# BUILD VECTOR INDEX  (cosine via IndexFlatIP + L2 norm)
 # ==========================================================
 @st.cache_resource(show_spinner=False)
-def build_index(chunks, model_name):
+def build_index(docs_hash, model_name):
     embed_model = SentenceTransformer(model_name)
-    texts = [c["text"] for c in chunks]
 
-    all_embeddings = []
-    total = len(texts)
-    progress = st.progress(0, text="Building vector index...")
+    # Try loading from disk first — skips embedding on warm starts
+    idx, chunks = load_index_safe(docs_hash)
+    if idx is not None:
+        st.success("⚡ Index loaded from disk instantly!")
+        return embed_model, idx, chunks
+
+    # Build from scratch
+    st.info("Building vector index (first run only — saved for future use)...")
+    texts    = [c["text"] for c in all_chunks]
+    emb_list = []
+    total    = len(texts)
+    prog     = st.progress(0, text="Building vector index...")
 
     for i in range(0, total, BATCH_SIZE):
         batch = texts[i:i + BATCH_SIZE]
-        emb = embed_model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
-        all_embeddings.append(emb)
-        progress.progress(
+        emb   = embed_model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
+        emb_list.append(emb)
+        prog.progress(
             min((i + BATCH_SIZE) / total, 1.0),
-            text=f"Embedding chunks... {min(i + BATCH_SIZE, total)}/{total}"
+            text=f"Embedding... {min(i + BATCH_SIZE, total)}/{total}"
         )
 
-    progress.empty()
-    embeddings = np.vstack(all_embeddings).astype("float32")
-    faiss.normalize_L2(embeddings)
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings)
+    prog.empty()
 
-    return embed_model, index, chunks
+    embeddings = np.vstack(emb_list).astype("float32")
+    faiss.normalize_L2(embeddings)          # cosine similarity via inner product
+
+    idx = faiss.IndexFlatIP(embeddings.shape[1])
+    idx.add(embeddings)
+
+    save_index(idx, all_chunks, docs_hash)
+    st.success("✅ Index built and saved to disk!")
+    return embed_model, idx, all_chunks
 
 
-st.info("⚙️ Building vector index...")
-embed_model, faiss_index, metadata = build_index(all_chunks, EMBED_MODEL_NAME)
-st.success("✅ Vector index ready")
+st.info("⚙️ Loading vector index...")
+embed_model, faiss_index, metadata = build_index(docs_hash, EMBED_MODEL_NAME)
+
+# Update sidebar index size now that index exists
+with st.sidebar:
+    if os.path.exists(INDEX_PATH):
+        st.caption(f"📦 Index: {os.path.getsize(INDEX_PATH)/1e6:.1f} MB")
+        st.caption(f"📄 Chunks: {len(all_chunks)}")
 
 # ==========================================================
 # CROSS-ENCODER RERANKER
@@ -238,60 +498,177 @@ st.success("✅ Cross-encoder reranker loaded")
 # ==========================================================
 @st.cache_resource
 def load_generator(model_name):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tok   = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
     model.eval()
-    return tokenizer, model
+    return tok, model
 
 
 tokenizer, gen_model = load_generator(GEN_MODEL_NAME)
 st.success("✅ Generation model loaded")
 
 # ==========================================================
-# RETRIEVAL → RERANKING
+# AUTO-DETECT SUBJECT/CLASS FROM QUESTION
 # ==========================================================
-def retrieve_and_rerank(query):
+def auto_detect_from_question(question):
+    q  = question.lower()
+    kw = {
+        "Business Studies": [
+            "management", "planning", "organising", "staffing", "directing",
+            "controlling", "entrepreneur", "marketing", "finance", "consumer",
+            "stock exchange", "recruitment", "motivation", "leadership",
+            "communication", "supervision", "business environment"
+        ],
+        "Economics": [
+            "gdp", "demand", "supply", "market", "price", "inflation", "deficit",
+            "budget", "fiscal", "monetary", "national income", "poverty",
+            "unemployment", "elasticity", "consumer equilibrium", "producer",
+            "revenue", "cost", "profit", "macro", "micro"
+        ],
+        "Polity": [
+            "constitution", "parliament", "president", "prime minister",
+            "fundamental rights", "directive principles", "judiciary",
+            "legislature", "executive", "election", "federalism", "preamble",
+            "lok sabha", "rajya sabha", "governor", "supreme court", "citizenship"
+        ],
+        "Psychology": [
+            "behaviour", "cognition", "perception", "memory", "learning",
+            "intelligence", "personality", "attitude", "motivation", "emotion",
+            "stress", "therapy", "disorder", "consciousness", "sensation"
+        ],
+        "Sociology": [
+            "society", "culture", "caste", "class", "gender", "tribe",
+            "institution", "socialisation", "community", "rural", "urban",
+            "inequality", "stratification", "kinship", "family", "religion",
+            "social change"
+        ],
+    }
+
+    detected_subject = "Unknown"
+    for subj, words in kw.items():
+        if any(w in q for w in words):
+            detected_subject = subj
+            break
+
+    detected_class = "Unknown"
+    if any(k in q for k in ["class 11", "11th", "first year"]):
+        detected_class = "Class 11"
+    elif any(k in q for k in ["class 12", "12th", "second year", "board"]):
+        detected_class = "Class 12"
+
+    return detected_subject, detected_class
+
+# ==========================================================
+# RETRIEVAL → FILTER → RERANK
+# ==========================================================
+def retrieve_and_rerank(query, sel_subject, sel_class, sel_types):
+    # Step 1 — embed + normalize query
     q_emb = embed_model.encode([query], convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(q_emb)
 
-    _, I = faiss_index.search(q_emb, RETRIEVE_K)
+    # Step 2 — fetch RETRIEVE_K candidates from FAISS
+    _, I       = faiss_index.search(q_emb, RETRIEVE_K)
     candidates = [metadata[i] for i in I[0] if i < len(metadata)]
 
     if not candidates:
         return []
 
-    pairs = [[query, c["text"]] for c in candidates]
+    # Step 3 — apply sidebar filters
+    filtered = []
+    for c in candidates:
+        if sel_subject != "Auto" and c["subject"]     != sel_subject: continue
+        if sel_class   != "Auto" and c["class_level"] != sel_class:   continue
+        if sel_types   and c["section_type"] not in sel_types:        continue
+        filtered.append(c)
+
+    if not filtered:
+        st.warning("⚠️ Filters too strict — showing unfiltered results.")
+        filtered = candidates
+
+    # Step 4 — cross-encoder reranking
+    pairs  = [[query, clean_chunk_text(c["text"])] for c in filtered]
     scores = reranker.predict(pairs)
-    ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-    return [chunk for _, chunk in ranked[:RERANK_TOP_K]]
+    ranked = sorted(zip(scores, filtered), key=lambda x: x[0], reverse=True)
+
+    return [c for _, c in ranked[:RERANK_TOP_K]]
+
+# ==========================================================
+# GROUNDING METADATA FOR PROMPT
+# ==========================================================
+def extract_context_metadata(chunks, question, sel_subject, sel_class):
+    if sel_subject != "Auto" and sel_class != "Auto":
+        return sel_subject, sel_class
+
+    subjects = set(c["subject"]     for c in chunks if c["subject"]     != "Unknown")
+    classes  = set(c["class_level"] for c in chunks if c["class_level"] != "Unknown")
+
+    subj_str = ", ".join(subjects) if subjects else ""
+    cls_str  = ", ".join(classes)  if classes  else ""
+
+    if not subj_str or not cls_str:
+        ds, dc   = auto_detect_from_question(question)
+        subj_str = subj_str or ds
+        cls_str  = cls_str  or dc
+
+    return subj_str or "NCERT", cls_str or "Class 11/12"
 
 # ==========================================================
 # PROMPT BUILDER
 # ==========================================================
-def build_prompt(context_chunks, question):
-    context_parts = []
-    for i, c in enumerate(context_chunks):
-        context_parts.append(f"[Passage {i+1}]\n{c['text']}")
-    context = "\n\n".join(context_parts)
+def build_prompt(context_chunks, question, sel_subject, sel_class):
+    subj, cls = extract_context_metadata(context_chunks, question, sel_subject, sel_class)
+
+    grounding = (
+        f"You are an expert NCERT tutor helping a {cls} student with {subj}."
+        if subj != "NCERT"
+        else f"You are an expert NCERT tutor for {cls} students."
+    )
+
+    context = "\n\n---\n\n".join(
+        f"[Passage {i+1}]\n{enrich_chunk_text(c)}"
+        for i, c in enumerate(context_chunks)
+    )
 
     return (
-        f"You are a helpful NCERT textbook tutor.\n"
-        f"Read the passages below carefully and answer the question using ONLY information from the passages.\n"
-        f"Give a complete, accurate answer in 2-4 sentences. Do not copy the question back.\n\n"
+        f"{grounding}\n\n"
+        f"Read the passages below and answer the question using ONLY information from the passages.\n"
+        f"Rules:\n"
+        f"1. If clearly present — answer simply and accurately in 2-4 sentences.\n"
+        f"2. If partially present — answer what you can and note what is missing.\n"
+        f"3. If NOT present — say exactly: \"I don't know based on the provided context.\"\n"
+        f"4. Never invent facts, definitions, or data not in the passages.\n\n"
         f"{context}\n\n"
         f"Question: {question}\n"
         f"Answer:"
     )
 
 # ==========================================================
-# GENERATION
+# POST-PROCESS ANSWER
 # ==========================================================
-def generate_answer(query):
-    retrieved = retrieve_and_rerank(query)
+def clean_answer(text):
+    sentences = text.split('. ')
+    seen, out = set(), []
+    for s in sentences:
+        if s.strip() not in seen:
+            seen.add(s.strip())
+            out.append(s.strip())
+    result = '. '.join(out)
+    if result and result[-1] not in '.!?':
+        parts = result.rsplit('.', 1)
+        if len(parts) > 1:
+            result = parts[0] + '.'
+    return result.strip()
+
+# ==========================================================
+# FULL PIPELINE
+# ==========================================================
+def generate_answer(query, sel_subject, sel_class, sel_types):
+    retrieved = retrieve_and_rerank(query, sel_subject, sel_class, sel_types)
+
     if not retrieved:
         return "No relevant information found.", []
 
-    prompt = build_prompt(retrieved, query)
+    prompt = build_prompt(retrieved, query, sel_subject, sel_class)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536)
 
     with torch.no_grad():
@@ -303,31 +680,51 @@ def generate_answer(query):
             no_repeat_ngram_size=3
         )
 
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer.strip(), retrieved
+    raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return clean_answer(raw), retrieved
 
 # ==========================================================
-# USER INTERFACE
+# UI
 # ==========================================================
-with st.sidebar:
-    st.header("⚙️ Retrieval Settings")
-    st.metric("Candidate pool (FAISS)", RETRIEVE_K)
-    st.metric("After reranking", RERANK_TOP_K)
-    st.caption(f"Embed model: `{EMBED_MODEL_NAME}`")
-    st.caption(f"Reranker: `{RERANK_MODEL_NAME}`")
-    st.caption(f"Generator: `{GEN_MODEL_NAME}`")
-
 st.markdown("---")
-query = st.text_input("💬 Ask your question from NCERT:", placeholder="e.g. What is photosynthesis?")
+query = st.text_input(
+    "💬 Ask your question:",
+    placeholder="e.g. What is the role of motivation in directing? / Explain price elasticity"
+)
 
 if query:
     with st.spinner("Retrieving, reranking and generating answer..."):
-        answer, retrieved_chunks = generate_answer(query)
+        answer, ret_chunks = generate_answer(
+            query, selected_subject, selected_class, selected_types
+        )
 
+    # Show auto-detection banner only when sidebar left on Auto
+    if selected_subject == "Auto" or selected_class == "Auto":
+        subj_used, cls_used = extract_context_metadata(
+            ret_chunks, query, selected_subject, selected_class
+        )
+        st.info(
+            f"🔍 Auto-detected: **{subj_used}** | **{cls_used}**  \n"
+            f"*Use sidebar filters to override if wrong.*"
+        )
+
+    # Answer
     st.markdown("## 📖 Answer")
-    st.write(answer)
+    if "don't know" in answer.lower():
+        st.warning(answer)
+    else:
+        st.success(answer)
 
-    st.markdown(f"## 📚 Top {RERANK_TOP_K} Reranked Chunks")
-    for i, chunk in enumerate(retrieved_chunks):
-        with st.expander(f"Chunk {i + 1} — {chunk['doc_id']}"):
-            st.write(chunk["text"])
+    # Sources
+    st.markdown(f"## 📚 Top {RERANK_TOP_K} Sources (After Reranking)")
+    for i, chunk in enumerate(ret_chunks):
+        label = (
+            f"Source {i+1}  —  "
+            f"{chunk.get('class_level','?')}  |  "
+            f"{chunk.get('subject','?')}  |  "
+            f"{chunk.get('chapter','?')}  |  "
+            f"{chunk.get('section_type','?').upper()}"
+        )
+        with st.expander(label):
+            st.caption(f"📄 `{chunk.get('doc_id','?')}`")
+            st.write(clean_chunk_text(chunk["text"]))
