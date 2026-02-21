@@ -13,7 +13,7 @@ import gdown
 import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, AutoModelForCausalLM  # CHANGED: CausalLM for decoder-only
 
 # ==========================================================
 # CONFIG
@@ -24,14 +24,14 @@ EXTRACT_DIR   = "ncert"
 
 CHUNK_SIZE    = 1200
 CHUNK_OVERLAP = 200
-MIN_CHUNK_LEN = 100          # FIX: skip garbage chunks shorter than this after cleaning
+MIN_CHUNK_LEN = 100
 
 EMBED_MODEL_NAME  = "all-MiniLM-L6-v2"
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-GEN_MODEL_NAME    = "google/flan-t5-base"
+GEN_MODEL_NAME    = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # CHANGED: decoder-only model
 
 RETRIEVE_K    = 20
-RERANK_TOP_K  = 2            # reduced from 6 so chunks fit fully in prompt
+RERANK_TOP_K  = 3            # slightly more chunks — TinyLlama handles longer context
 BATCH_SIZE    = 64
 
 INDEX_PATH    = "faiss_index.bin"
@@ -186,10 +186,6 @@ data_path, pdf_files = download_and_extract(FILE_ID)
 # METADATA HELPERS
 # ==========================================================
 def parse_metadata_from_folder(folder_path):
-    """
-    Primary source — reads folder name directly.
-    'class 11 business studies' → Class 11, Business Studies
-    """
     parts       = folder_path.lower().replace("\\", "/").split("/")
     class_level = "Unknown"
     subject     = "Unknown"
@@ -207,26 +203,15 @@ def parse_metadata_from_folder(folder_path):
 
 
 def parse_metadata_from_filename(filename):
-    """
-    Fallback — decode NCERT 2-letter subject code from filename.
-
-    FIX 1: pattern now requires digit after subject code to avoid false matches
-            e.g. leps104.pdf → 'ps' followed by '1' → Psychology (correct)
-            without fix: leps matched 'ps' but also caught wrong codes
-
-    FIX 2: chapter numbers > 20 are catalog/ISBN codes, not real chapters
-            e.g. leps104 → 104 is discarded, not stored as 'Chapter 104'
-    """
     name    = filename.lower().replace(".pdf", "")
     subject = "Unknown"
     chapter = "Unknown"
 
-    # Must be followed by a digit to avoid false positives
-    m = re.match(r'^[lik]e([a-z]{2})\d', name)
+    # FIX: e+ handles prefixes like 'leec' (lee + ec...)
+    m = re.match(r'^[lik]e+([a-z]{2})\d', name)
     if m:
         subject = FILENAME_CODE_MAP.get(m.group(1), "Unknown")
 
-    # Only keep plausible chapter numbers (1-20), discard catalog codes
     numbers       = re.findall(r'\d+', name)
     real_chapters = [n for n in numbers if int(n) <= 20]
     if real_chapters:
@@ -239,10 +224,8 @@ def get_full_metadata(full_path):
     folder   = os.path.dirname(full_path)
     filename = os.path.basename(full_path)
 
-    # Folder name is ground truth for class + subject
     class_level, subject = parse_metadata_from_folder(folder)
 
-    # Only use filename as fallback if folder gave nothing
     if subject == "Unknown":
         subject, _ = parse_metadata_from_filename(filename)
 
@@ -367,10 +350,6 @@ def split_documents(docs, chunk_size, overlap):
         meta   = get_full_metadata(doc["full_path"])
         pieces = splitter.split_text(doc["text"])
         for i, piece in enumerate(pieces):
-
-            # FIX: clean first, then check length
-            # Skips blank pages, header-only pages, numbered list fragments
-            # that were showing up as empty source expanders
             cleaned = clean_chunk_text(piece)
             if len(cleaned) < MIN_CHUNK_LEN:
                 continue
@@ -389,7 +368,6 @@ def split_documents(docs, chunk_size, overlap):
 
 @st.cache_resource
 def split_documents_cached(docs_hash, chunk_size, overlap):
-    # docs_hash in signature → cache busts automatically when PDFs change
     return split_documents(documents, chunk_size, overlap)
 
 
@@ -401,7 +379,6 @@ if not all_chunks:
 
 st.success(f"✅ Created {len(all_chunks)} text chunks")
 
-# Sanity check — show detected subjects/classes
 det_subjects = sorted(set(c["subject"]     for c in all_chunks if c["subject"]     != "Unknown"))
 det_classes  = sorted(set(c["class_level"] for c in all_chunks if c["class_level"] != "Unknown"))
 if det_subjects:
@@ -500,18 +477,23 @@ reranker = load_reranker(RERANK_MODEL_NAME)
 st.success("✅ Cross-encoder reranker loaded")
 
 # ==========================================================
-# GENERATION MODEL (flan-t5-base)
+# GENERATION MODEL — TinyLlama (decoder-only)
+# CHANGED: AutoModelForCausalLM instead of AutoModelForSeq2SeqLM
+# TinyLlama supports 2048 token context and generates 300-500 words
 # ==========================================================
 @st.cache_resource
 def load_generator(model_name):
     tok   = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float32   # float32 for CPU compatibility
+    )
     model.eval()
     return tok, model
 
 
 tokenizer, gen_model = load_generator(GEN_MODEL_NAME)
-st.success("✅ Generation model loaded")
+st.success("✅ Generation model loaded (TinyLlama-1.1B)")
 
 # ==========================================================
 # AUTO-DETECT SUBJECT/CLASS FROM QUESTION
@@ -566,19 +548,28 @@ def auto_detect_from_question(question):
 
 # ==========================================================
 # HyDE — Hypothetical Document Embedding
-# Generate a fake answer with flan-t5, then embed THAT for retrieval.
-# Bridges the gap between question-space and passage-space embeddings.
+# CHANGED: TinyLlama chat format for hypothetical generation
 # ==========================================================
 def hypothetical_answer(question):
-    prompt = f"Write a short explanation about: {question}"
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128)
+    prompt = (
+        f"<|system|>You are a helpful tutor.</s>"
+        f"<|user|>Write a short 2-3 sentence explanation about: {question}</s>"
+        f"<|assistant|>"
+    )
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
     with torch.no_grad():
-        out = gen_model.generate(**inputs, max_new_tokens=80, num_beams=2)
-    return tokenizer.decode(out[0], skip_special_tokens=True)
+        out = gen_model.generate(
+            **inputs,
+            max_new_tokens=80,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    # Strip the prompt tokens — decoder-only includes prompt in output
+    generated = out[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(generated, skip_special_tokens=True)
 
 # ==========================================================
 # DEDUP — Remove near-duplicate chunks caused by chunk overlap
-# Prevents the same passage appearing multiple times in retrieved results.
 # ==========================================================
 def deduplicate_chunks(chunks, threshold=0.8):
     seen, result = [], []
@@ -598,8 +589,7 @@ def deduplicate_chunks(chunks, threshold=0.8):
 # RETRIEVAL → FILTER → DEDUP → RERANK
 # ==========================================================
 def retrieve_and_rerank(query, sel_subject, sel_class, sel_types):
-    # HyDE: embed a hypothetical answer instead of the raw question
-    # for better semantic alignment with passage embeddings
+    # HyDE: embed a hypothetical answer for better semantic alignment
     hyp   = hypothetical_answer(query)
     q_emb = embed_model.encode([hyp], convert_to_numpy=True).astype("float32")
     faiss.normalize_L2(q_emb)
@@ -651,24 +641,23 @@ def extract_context_metadata(chunks, question, sel_subject, sel_class):
     return subj_str or "NCERT", cls_str or "Class 11/12"
 
 # ==========================================================
-# PROMPT BUILDER
-# flan-t5 works best with short, direct prompts — keep context tight
+# PROMPT BUILDER — TinyLlama chat format
+# CHANGED: uses <|system|> / <|user|> / <|assistant|> tags
 # ==========================================================
 def build_prompt(context_chunks, question, sel_subject, sel_class):
     subj, cls = extract_context_metadata(context_chunks, question, sel_subject, sel_class)
 
-    # Use only cleaned text (no metadata prefix) to save tokens for flan-t5
     context = "\n\n".join(
-        f"Passage {i+1}: {clean_chunk_text(c['text'])}"
+        f"Passage {i+1}:\n{clean_chunk_text(c['text'])}"
         for i, c in enumerate(context_chunks)
     )
 
     return (
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer using only the context above. "
-        f"Quote relevant parts of the passages in your answer from best chunk.\n"
-        f"Answer:"
+        f"<|system|>You are an expert NCERT tutor for {subj}, {cls}. "
+        f"Answer the student's question clearly and in detail using only the provided passages. "
+        f"Give a well-structured explanation in 150-250 words.</s>"
+        f"<|user|>Passages:\n{context}\n\nQuestion: {question}</s>"
+        f"<|assistant|>"
     )
 
 # ==========================================================
@@ -708,20 +697,23 @@ def generate_answer(query, sel_subject, sel_class, sel_types):
 
     prompt = build_prompt(retrieved, query, sel_subject, sel_class)
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    # CHANGED: TinyLlama supports 2048 token context — much more than Flan-T5's 512
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
 
     with torch.no_grad():
         outputs = gen_model.generate(
             **inputs,
-            max_new_tokens=512,
-            min_new_tokens=50,        # force at least 50 tokens — avoids fragment answers
-            num_beams=4,
-            early_stopping=True,
-            no_repeat_ngram_size=3,
-            length_penalty=2.0        # penalise short answers
+            max_new_tokens=350,          # CHANGED: TinyLlama can generate much more
+            do_sample=False,             # greedy for factual consistency
+            repetition_penalty=1.3,      # prevent looping/repetition
+            pad_token_id=tokenizer.eos_token_id
         )
 
-    raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # CHANGED: decoder-only includes prompt in output — strip prompt tokens
+    prompt_len = inputs["input_ids"].shape[1]
+    generated  = outputs[0][prompt_len:]
+    raw        = tokenizer.decode(generated, skip_special_tokens=True)
+
     return clean_answer(raw), retrieved
 
 # ==========================================================
@@ -749,7 +741,7 @@ if query:
         )
 
     st.markdown("## 📖 Answer")
-    if "don't know" in answer.lower():
+    if "don't know" in answer.lower() or "cannot answer" in answer.lower():
         st.warning(answer)
     else:
         st.success(answer)
@@ -765,5 +757,4 @@ if query:
         )
         with st.expander(label):
             st.caption(f"📄 `{chunk.get('doc_id','?')}`")
-            # FIX: removed duplicate st.write — only render highlighted markdown once
             st.markdown(highlight_terms(clean_chunk_text(chunk["text"]), query))
