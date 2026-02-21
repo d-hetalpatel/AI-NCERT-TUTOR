@@ -636,7 +636,7 @@ def build_prompt(context_chunks, question, sel_subject, sel_class):
         f"Context:\n{context}\n\n"
         f"Question: {question}\n\n"
         f"Answer using only the context above. "
-        f"Quote relevant parts of the passages in your answer.\n"
+        f"Quote relevant parts of the passages in your answer from best chunk.\n"
         f"Answer:"
     )
 
