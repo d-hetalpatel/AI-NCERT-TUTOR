@@ -31,7 +31,7 @@ RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 GEN_MODEL_NAME    = "google/flan-t5-base"
 
 RETRIEVE_K    = 20
-RERANK_TOP_K  = 4            # reduced from 6 so chunks fit fully in prompt
+RERANK_TOP_K  = 2            # reduced from 6 so chunks fit fully in prompt
 BATCH_SIZE    = 64
 
 INDEX_PATH    = "faiss_index.bin"
