@@ -684,7 +684,12 @@ def generate_answer(query, sel_subject, sel_class, sel_types):
 
     raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return clean_answer(raw), retrieved
-
+    
+def highlight_terms(text, query):
+    for word in query.split():
+        if len(word) > 3:
+            text = re.sub(f"(?i)({re.escape(word)})", r"**\1**", text)
+    return text
 # ==========================================================
 # UI
 # ==========================================================
@@ -727,3 +732,4 @@ if query:
         with st.expander(label):
             st.caption(f"📄 `{chunk.get('doc_id','?')}`")
             st.write(clean_chunk_text(chunk["text"]))
+            st.markdown(highlight_terms(clean_chunk_text(chunk["text"]), query))
